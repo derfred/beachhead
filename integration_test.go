@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -253,5 +254,103 @@ func TestUploadDownloadIntegration(t *testing.T) {
 	// Verify the content
 	if string(downloadedContent) != fileContent {
 		t.Fatalf("File content mismatch: expected %s, got %s", fileContent, string(downloadedContent))
+	}
+}
+
+func TestExecIntegration(t *testing.T) {
+	// Generate test certificates (similar to buildServer)
+	cert, privKey, err := GenerateTestCert("localhost")
+	if err != nil {
+		t.Fatalf("Failed to generate test certificate: %v", err)
+	}
+	certPool := x509.NewCertPool()
+	certPool.AddCert(cert)
+
+	certFile, err := os.CreateTemp("", "cert")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(certFile.Name())
+	keyFile, err := os.CreateTemp("", "key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(keyFile.Name())
+	if err := pem.Encode(certFile, &pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw}); err != nil {
+		t.Fatal(err)
+	}
+	privKeyBytes, err := x509.MarshalPKCS8PrivateKey(privKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pem.Encode(keyFile, &pem.Block{Type: "PRIVATE KEY", Bytes: privKeyBytes}); err != nil {
+		t.Fatal(err)
+	}
+	certFile.Close()
+	keyFile.Close()
+
+	// Setup server config with a shell template for exec.
+	cfg := config{
+		internalPort: 0,
+		externalPort: 0,
+		authToken:    "test-token",
+		mode:         "server",
+		certFile:     certFile.Name(),
+		keyFile:      keyFile.Name(),
+		ShellTemplates: map[string]ShellTemplate{
+			"echo": {Template: "echo {{.Args}}"},
+		},
+	}
+	server := NewServer(cfg)
+	go server.Start()
+	defer server.Shutdown()
+
+	// Wait briefly for the server to start.
+	time.Sleep(500 * time.Millisecond)
+
+	// Prepare the exec request.
+	reqBody, err := json.Marshal(map[string]string{
+		"cmd":  "echo",
+		"args": "Hello Exec",
+	})
+	if err != nil {
+		t.Fatalf("Failed to marshal JSON: %v", err)
+	}
+
+	// Create an HTTP client with TLS config.
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{RootCAs: certPool},
+		},
+	}
+
+	execURL := fmt.Sprintf("https://localhost:%d/exec", server.GetExternalPort())
+	req, err := http.NewRequest(http.MethodPost, execURL, bytes.NewBuffer(reqBody))
+	if err != nil {
+		t.Fatalf("Failed to create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	// Perform the request.
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to perform exec request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Read the output.
+	output, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("Failed to read response body: %v", err)
+	}
+
+	// Validate output and exit code.
+	if !bytes.Contains(output, []byte("Hello Exec")) {
+		t.Fatalf("Expected output to contain 'Hello Exec', got: %s", output)
+	}
+	exitCode := resp.Trailer.Get("X-Exit-Code")
+	if exitCode != "0" {
+		t.Fatalf("Expected exit code '0', got: %s", exitCode)
 	}
 }

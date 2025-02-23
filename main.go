@@ -8,19 +8,40 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 )
 
+// ShellTemplate holds an optional user and a command template.
+type ShellTemplate struct {
+	User     string
+	Template string
+}
+
 type config struct {
-	internalPort int
-	externalPort int
-	authToken    string
-	endpoint     string
-	upstream     string
-	mode         string
-	skipVerify   bool
-	certFile     string
-	keyFile      string
-	caFile       string
+	internalPort   int
+	externalPort   int
+	authToken      string
+	endpoint       string
+	upstream       string
+	mode           string
+	skipVerify     bool
+	certFile       string
+	keyFile        string
+	caFile         string
+	shellFlags     []string
+	ShellTemplates map[string]ShellTemplate
+}
+
+// Custom flag value to allow multiple -shell flags.
+type shellFlag []string
+
+func (s *shellFlag) String() string {
+	return strings.Join(*s, ",")
+}
+
+func (s *shellFlag) Set(value string) error {
+	*s = append(*s, value)
+	return nil
 }
 
 func (c config) makeTlsconfig() (*tls.Config, error) {
@@ -65,6 +86,71 @@ func setupServerFlags(fs *flag.FlagSet, cfg *config) {
 		"Path to certificate authority file (env: CA_FILE)")
 	fs.StringVar(&cfg.authToken, "auth-token", os.Getenv("AUTH_TOKEN"),
 		"Authorization token (env: AUTH_TOKEN)")
+
+	var shells shellFlag
+	fs.Var(&shells, "shell", "Define shell command template in format name[@user]:template")
+	cfg.shellFlags = shells
+}
+
+// new helper to parse a shell flag of form "name[@user]:template"
+func parseShellFlag(s string) (name, user, tmpl string, err error) {
+	parts := strings.SplitN(s, ":", 2)
+	if len(parts) != 2 {
+		return "", "", "", fmt.Errorf("invalid shell flag format")
+	}
+	left := parts[0]
+	tmpl = parts[1]
+	if at := strings.Index(left, "@"); at != -1 {
+		name = left[:at]
+		user = left[at+1:]
+	} else {
+		name = left
+	}
+	return name, user, tmpl, nil
+}
+
+// new helper to process env vars starting with BEACHHEAD_SHELL_
+func processShellEnv() map[string]ShellTemplate {
+	templates := make(map[string]ShellTemplate)
+	for _, env := range os.Environ() {
+		if strings.HasPrefix(env, "BEACHHEAD_SHELL_") {
+			kv := strings.SplitN(env, "=", 2)
+			if len(kv) != 2 {
+				continue
+			}
+			key := kv[0]
+			// command name is lower-case of suffix after BEACHHEAD_SHELL_
+			name := strings.ToLower(strings.TrimPrefix(key, "BEACHHEAD_SHELL_"))
+			val := kv[1]
+			// For env var, if a colon is present, the portion before colon is user.
+			if idx := strings.Index(val, ":"); idx != -1 {
+				user := val[:idx]
+				tmpl := val[idx+1:]
+				templates[name] = ShellTemplate{User: user, Template: tmpl}
+			} else {
+				templates[name] = ShellTemplate{Template: val}
+			}
+		}
+	}
+	return templates
+}
+
+// Process shell flags and env vars after flag parsing.
+func processShellTemplates(cfg *config) {
+	cfg.ShellTemplates = make(map[string]ShellTemplate)
+	// Process -shell flag entries.
+	for _, s := range cfg.shellFlags {
+		name, user, tmpl, err := parseShellFlag(s)
+		if err != nil {
+			log.Fatalf("Error parsing -shell flag: %v", err)
+		}
+		cfg.ShellTemplates[name] = ShellTemplate{User: user, Template: tmpl}
+	}
+	// Merge in env var definitions (env takes lower-case key).
+	envTemplates := processShellEnv()
+	for name, t := range envTemplates {
+		cfg.ShellTemplates[name] = t
+	}
 }
 
 func setupClientFlags(fs *flag.FlagSet, cfg *config) {
@@ -95,6 +181,9 @@ func loadConfig() config {
 		if cfg.authToken == "" {
 			log.Fatal("Authorization token not set")
 		}
+		processShellTemplates(&cfg) // process new shell template definitions
+		// Expose shell templates to other parts.
+		globalShellTemplates = cfg.ShellTemplates
 
 	case "client":
 		clientCmd := flag.NewFlagSet("client", flag.ExitOnError)

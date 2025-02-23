@@ -61,7 +61,7 @@ func NewServer(cfg config) *Server {
 	extMux := http.NewServeMux()
 	extMux.HandleFunc("/health", HealthHandler)
 	extMux.HandleFunc("/version", VersionHandler)
-	extMux.Handle("/exec", authenticate(cfg.authToken, http.HandlerFunc(ExecHandler)))
+	extMux.Handle("/exec", authenticate(cfg.authToken, MakeExecHandler(cfg.ShellTemplates)))
 	extMux.Handle("/upload", authenticate(cfg.authToken, http.HandlerFunc(UploadHandler)))
 	extMux.Handle("/download", authenticate(cfg.authToken, http.HandlerFunc(DownloadHandler)))
 	extMux.Handle("/ws", authenticate(cfg.authToken, http.HandlerFunc(proxy.HandleConnection)))

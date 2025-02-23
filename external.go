@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
 	"io"
 	"math/rand"
 	"net/http"
@@ -9,7 +12,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"text/template"
 )
+
+type ExecRequest struct {
+	Cmd  string `json:"cmd"`
+	Args string `json:"args"`
+}
 
 var version = "1.0.0"
 
@@ -18,6 +27,67 @@ var (
 	fileMap     = make(map[string]string)
 	fileMapLock sync.Mutex
 )
+
+type CommandExecutor struct {
+	shellTemplates map[string]ShellTemplate
+}
+
+func NewCommandExecutor(templates map[string]ShellTemplate) *CommandExecutor {
+	return &CommandExecutor{
+		shellTemplates: templates,
+	}
+}
+
+func (e *CommandExecutor) Execute(cmd, args string, w io.Writer) (int, error) {
+	shellTmpl, exists := e.shellTemplates[cmd]
+	if !exists {
+		return 0, fmt.Errorf("command not found: %s", cmd)
+	}
+
+	tmpl, err := template.New("cmd").Parse(shellTmpl.Template)
+	if err != nil {
+		return 0, fmt.Errorf("template parse error: %v", err)
+	}
+
+	var cmdStr bytes.Buffer
+	err = tmpl.Execute(&cmdStr, map[string]string{"Args": args})
+	if err != nil {
+		return 0, fmt.Errorf("template execution error: %v", err)
+	}
+
+	finalCmd := cmdStr.String()
+	if shellTmpl.User != "" {
+		finalCmd = "sudo -u " + shellTmpl.User + " " + finalCmd
+	}
+
+	shellcmd := exec.Command("sh", "-c", finalCmd)
+	stdout, err := shellcmd.StdoutPipe()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get stdout: %v", err)
+	}
+	stderr, err := shellcmd.StderrPipe()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get stderr: %v", err)
+	}
+
+	if err := shellcmd.Start(); err != nil {
+		return 0, fmt.Errorf("failed to start command: %v", err)
+	}
+
+	reader := io.MultiReader(stdout, stderr)
+	if _, err := io.Copy(w, reader); err != nil {
+		return 0, fmt.Errorf("failed to copy output: %v", err)
+	}
+
+	err = shellcmd.Wait()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return exitErr.ExitCode(), nil
+		}
+		return 1, err
+	}
+	return 0, nil
+}
 
 // HealthHandler responds with 200 OK.
 func HealthHandler(w http.ResponseWriter, r *http.Request) {
@@ -31,71 +101,40 @@ func VersionHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(version))
 }
 
-// ExecHandler executes a shell command provided via query parameter "cmd".
-// It streams stdout/stderr in a chunked response and returns the exit code as a trailer.
-func ExecHandler(w http.ResponseWriter, r *http.Request) {
-	cmdStr := r.URL.Query().Get("cmd")
-	if cmdStr == "" {
-		http.Error(w, "cmd query parameter missing", http.StatusBadRequest)
-		return
-	}
-
-	// Create the command.
-	cmd := exec.Command("sh", "-c", cmdStr)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		http.Error(w, "Failed to get stdout: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		http.Error(w, "Failed to get stderr: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Start the command.
-	if err := cmd.Start(); err != nil {
-		http.Error(w, "Failed to start command: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Set trailer header for exit code.
-	w.Header().Set("Trailer", "X-Exit-Code")
-	w.Header().Set("Content-Type", "text/plain")
-	// Flush headers.
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
-
-	// Stream stdout and stderr.
-	// Here we simply merge the two streams.
-	reader := io.MultiReader(stdout, stderr)
-	buf := make([]byte, 1024)
-	for {
-		n, err := reader.Read(buf)
-		if n > 0 {
-			w.Write(buf[:n])
-			if f, ok := w.(http.Flusher); ok {
-				f.Flush()
-			}
+// Replace ExecHandler with MakeExecHandler that uses a passed-in shellTemplates
+func MakeExecHandler(shellTemplates map[string]ShellTemplate) http.HandlerFunc {
+	executor := NewCommandExecutor(shellTemplates)
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Only accept POST requests
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
 		}
+
+		var req ExecRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid JSON request: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		if req.Cmd == "" {
+			http.Error(w, "cmd field is required", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Trailer", "X-Exit-Code")
+		w.Header().Set("Content-Type", "text/plain")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+
+		exitCode, err := executor.Execute(req.Cmd, req.Args, w)
 		if err != nil {
-			break
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
+		w.Header().Set("X-Exit-Code", strconv.Itoa(exitCode))
 	}
-
-	// Wait for command to finish.
-	err = cmd.Wait()
-	exitCode := 0
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else {
-			exitCode = 1
-		}
-	}
-	// Set the trailer exit code.
-	w.Header().Set("X-Exit-Code", strconv.Itoa(exitCode))
 }
 
 func generateRandomID() string {
