@@ -182,8 +182,6 @@ func loadConfig() config {
 			log.Fatal("Authorization token not set")
 		}
 		processShellTemplates(&cfg) // process new shell template definitions
-		// Expose shell templates to other parts.
-		globalShellTemplates = cfg.ShellTemplates
 
 	case "client":
 		clientCmd := flag.NewFlagSet("client", flag.ExitOnError)
