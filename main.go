@@ -6,9 +6,8 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"math/rand"
 	"os"
-	"time"
+	"strconv"
 )
 
 type config struct {
@@ -42,51 +41,90 @@ func (c config) makeTlsconfig() (*tls.Config, error) {
 	return &tlsConfig, nil
 }
 
-func init() {
-	rand.Seed(time.Now().UnixNano())
-}
-
-func envInt(key string, fallback int) int {
-	if v := os.Getenv(key); v != "" {
-		if i, err := fmt.Sscanf(v, "%d"); err == nil {
-			return i
+func envInt(key string, defaultVal int) int {
+	if val := os.Getenv(key); val != "" {
+		if parsed, err := strconv.Atoi(val); err == nil {
+			return parsed
 		}
 	}
-	return fallback
+	return defaultVal
+}
+
+func setupServerFlags(fs *flag.FlagSet, cfg *config) {
+	fs.IntVar(&cfg.internalPort, "internal-port", envInt("INTERNAL_PORT", 8080),
+		"Internal HTTP server port (env: INTERNAL_PORT)")
+	fs.IntVar(&cfg.externalPort, "external-port", envInt("EXTERNAL_PORT", 443),
+		"External HTTPS server port (env: EXTERNAL_PORT)")
+	fs.BoolVar(&cfg.skipVerify, "skip-verify", os.Getenv("SKIP_VERIFY") == "true",
+		"Skip TLS certificate verification (env: SKIP_VERIFY)")
+	fs.StringVar(&cfg.certFile, "cert-file", os.Getenv("SSL_CERT"),
+		"Path to SSL certificate file (env: SSL_CERT)")
+	fs.StringVar(&cfg.keyFile, "key-file", os.Getenv("SSL_KEY"),
+		"Path to SSL key file (env: SSL_KEY)")
+	fs.StringVar(&cfg.caFile, "ca-file", os.Getenv("CA_FILE"),
+		"Path to certificate authority file (env: CA_FILE)")
+	fs.StringVar(&cfg.authToken, "auth-token", os.Getenv("AUTH_TOKEN"),
+		"Authorization token (env: AUTH_TOKEN)")
+}
+
+func setupClientFlags(fs *flag.FlagSet, cfg *config) {
+	fs.StringVar(&cfg.endpoint, "endpoint", os.Getenv("ENDPOINT"),
+		"WebSocket endpoint (env: ENDPOINT)")
+	fs.StringVar(&cfg.upstream, "upstream", os.Getenv("UPSTREAM"),
+		"Upstream server URL (env: UPSTREAM)")
+	fs.BoolVar(&cfg.skipVerify, "skip-verify", os.Getenv("SKIP_VERIFY") == "true",
+		"Skip TLS certificate verification (env: SKIP_VERIFY)")
+	fs.StringVar(&cfg.authToken, "auth-token", os.Getenv("AUTH_TOKEN"),
+		"Authorization token (env: AUTH_TOKEN)")
 }
 
 func loadConfig() config {
-	cfg := config{}
-
-	// Define flags with env var fallbacks
-	flag.IntVar(&cfg.internalPort, "internal-port",
-		envInt("INTERNAL_PORT", 8080),
-		"Internal HTTP server port")
-	flag.IntVar(&cfg.externalPort, "external-port",
-		envInt("EXTERNAL_PORT", 443),
-		"External HTTPS server port")
-	flag.StringVar(&cfg.mode, "mode", "server", "Mode to run: client or server")
-	flag.StringVar(&cfg.endpoint, "endpoint", "", "WebSocket endpoint (client mode)")
-	flag.StringVar(&cfg.upstream, "upstream", "", "Upstream server URL (client mode)")
-	flag.BoolVar(&cfg.skipVerify, "skip-verify",
-		os.Getenv("SKIP_VERIFY") == "true",
-		"Skip TLS certificate verification")
-	flag.StringVar(&cfg.certFile, "cert-file", os.Getenv("SSL_CERT"), "Path to SSL certificate file")
-	flag.StringVar(&cfg.keyFile, "key-file", os.Getenv("SSL_KEY"), "Path to SSL key file")
-	flag.StringVar(&cfg.caFile, "ca-file", os.Getenv("CA_FILE"), "Path to certificate authority file")
-	flag.Parse()
-
-	// Auth token is required
-	cfg.authToken = os.Getenv("AUTH_TOKEN")
-	if cfg.authToken == "" {
-		log.Fatal("AUTH_TOKEN env variable not set")
+	if len(os.Args) < 2 {
+		printUsageAndExit()
 	}
 
-	if cfg.mode == "client" && (cfg.endpoint == "" || cfg.upstream == "") {
-		log.Fatal("Both endpoint and upstream must be specified in client mode")
+	cfg := config{}
+	cfg.mode = os.Args[1]
+
+	switch cfg.mode {
+	case "server":
+		serverCmd := flag.NewFlagSet("server", flag.ExitOnError)
+		setupServerFlags(serverCmd, &cfg)
+		serverCmd.Parse(os.Args[2:])
+
+		if cfg.authToken == "" {
+			log.Fatal("Authorization token not set")
+		}
+
+	case "client":
+		clientCmd := flag.NewFlagSet("client", flag.ExitOnError)
+		setupClientFlags(clientCmd, &cfg)
+		clientCmd.Parse(os.Args[2:])
+
+		if cfg.authToken == "" {
+			log.Fatal("Authorization token not set")
+		}
+		if cfg.endpoint == "" || cfg.upstream == "" {
+			log.Fatal("Both endpoint and upstream must be specified in client mode")
+		}
+
+	default:
+		printUsageAndExit()
 	}
 
 	return cfg
+}
+
+func printUsageAndExit() {
+	fmt.Printf(`Usage: %s <mode> [options]
+
+Modes:
+  server    Run in server mode
+  client    Run in client mode
+
+Run '%s <mode> -h' for mode-specific options
+`, os.Args[0], os.Args[0])
+	os.Exit(1)
 }
 
 func RunClient(cfg config) {
