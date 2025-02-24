@@ -187,16 +187,18 @@ func TestUploadDownloadIntegration(t *testing.T) {
 	defer cleanup()
 	time.Sleep(1 * time.Second)
 
-	// Create a file to upload
-	fileContent := "This is a test file."
-	fileBuffer := &bytes.Buffer{}
-	writer := multipart.NewWriter(fileBuffer)
-	part, err := writer.CreateFormFile("file", "testfile.txt")
+	// Create a test workspace first
+	tempWorkspace, err := os.MkdirTemp("", "workspace_test_*")
 	if err != nil {
-		t.Fatalf("Failed to create form file: %v", err)
+		t.Fatalf("Failed to create temp workspace: %v", err)
 	}
-	part.Write([]byte(fileContent))
-	writer.Close()
+	defer os.RemoveAll(tempWorkspace)
+
+	// Set the workspace
+	server.workspaceCurrent = tempWorkspace
+
+	// Create file content
+	fileContent := []byte("This is a test file.")
 
 	// Create custom HTTP client with cert verification
 	client := &http.Client{
@@ -208,11 +210,11 @@ func TestUploadDownloadIntegration(t *testing.T) {
 	}
 
 	// Upload the file
-	req, err := http.NewRequest("POST", fmt.Sprintf("https://localhost:%d/upload", server.GetExternalPort()), fileBuffer)
+	uploadURL := fmt.Sprintf("https://localhost:%d/workspace/upload/testfile.txt", server.GetExternalPort())
+	req, err := http.NewRequest(http.MethodPut, uploadURL, bytes.NewReader(fileContent))
 	if err != nil {
 		t.Fatalf("Failed to create upload request: %v", err)
 	}
-	req.Header.Set("Content-Type", writer.FormDataContentType())
 	req.Header.Set("Authorization", "Bearer test-token")
 
 	resp, err := client.Do(req)
@@ -222,18 +224,12 @@ func TestUploadDownloadIntegration(t *testing.T) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("Unexpected status code: %d", resp.StatusCode)
-	}
-
-	// Read the file ID from the response
-	fileID, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("Failed to read response body: %v", err)
+		t.Fatalf("Upload failed with status %d", resp.StatusCode)
 	}
 
 	// Download the file
-	downloadURL := fmt.Sprintf("https://localhost:%d/download?id=%s", server.GetExternalPort(), fileID)
-	req, err = http.NewRequest("GET", downloadURL, nil)
+	downloadURL := fmt.Sprintf("https://localhost:%d/workspace/download/testfile.txt", server.GetExternalPort())
+	req, err = http.NewRequest(http.MethodGet, downloadURL, nil)
 	if err != nil {
 		t.Fatalf("Failed to create download request: %v", err)
 	}
@@ -246,18 +242,18 @@ func TestUploadDownloadIntegration(t *testing.T) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("Unexpected status code: %d", resp.StatusCode)
+		t.Fatalf("Download failed with status %d", resp.StatusCode)
 	}
 
-	// Read the downloaded file content
+	// Read the downloaded content
 	downloadedContent, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("Failed to read downloaded file: %v", err)
 	}
 
 	// Verify the content
-	if string(downloadedContent) != fileContent {
-		t.Fatalf("File content mismatch: expected %s, got %s", fileContent, string(downloadedContent))
+	if !bytes.Equal(downloadedContent, fileContent) {
+		t.Fatalf("File content mismatch: expected %s, got %s", fileContent, downloadedContent)
 	}
 }
 

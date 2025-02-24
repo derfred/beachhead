@@ -267,77 +267,6 @@ func generateRandomID() string {
 	return string(b)
 }
 
-// UploadHandler accepts a file upload and saves it to a temporary file.
-// It returns the ID of the file.
-func UploadHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
-		return
-	}
-
-	file, _, err := r.FormFile("file")
-	if err != nil {
-		http.Error(w, "Failed to get file: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	defer file.Close()
-
-	id := generateRandomID()
-	filePath := filepath.Join(os.TempDir(), id)
-
-	out, err := os.Create(filePath)
-	if err != nil {
-		http.Error(w, "Failed to create file: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer out.Close()
-
-	_, err = io.Copy(out, file)
-	if err != nil {
-		http.Error(w, "Failed to save file: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	fileMapLock.Lock()
-	fileMap[id] = filePath
-	fileMapLock.Unlock()
-
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(id))
-}
-
-// DownloadHandler serves a file for download given its ID.
-func DownloadHandler(w http.ResponseWriter, r *http.Request) {
-	id := r.URL.Query().Get("id")
-	if id == "" {
-		http.Error(w, "id query parameter missing", http.StatusBadRequest)
-		return
-	}
-
-	fileMapLock.Lock()
-	filePath, exists := fileMap[id]
-	fileMapLock.Unlock()
-
-	if !exists {
-		http.Error(w, "File not found", http.StatusNotFound)
-		return
-	}
-
-	file, err := os.Open(filePath)
-	if err != nil {
-		http.Error(w, "Failed to open file: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer file.Close()
-
-	w.Header().Set("Content-Disposition", "attachment; filename="+id)
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.WriteHeader(http.StatusOK)
-	if _, err := io.Copy(w, file); err != nil {
-		http.Error(w, "Failed to send file: "+err.Error(), http.StatusInternalServerError)
-	}
-}
-
 // WorkspaceHandler extracts a zip file from the request into a temp directory.
 func MakeWorkspaceHandler(server *Server) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -428,5 +357,106 @@ func MakeWorkspaceHandler(server *Server) http.HandlerFunc {
 		// For future operations, the new workspace base is now tmpDir.
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("Workspace set to: " + tmpDir))
+	}
+}
+
+func MakeWorkspaceUploadHandler(server *Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		if server.workspaceCurrent == "" {
+			http.Error(w, "No workspace set", http.StatusBadRequest)
+			return
+		}
+
+		filename := strings.TrimPrefix(r.URL.Path, "/workspace/upload/")
+		if filename == "" {
+			http.Error(w, "Filename required", http.StatusBadRequest)
+			return
+		}
+
+		targetPath := filepath.Join(server.workspaceCurrent, filename)
+		// Prevent path traversal
+		if !strings.HasPrefix(targetPath, server.workspaceCurrent) {
+			http.Error(w, "Invalid path", http.StatusBadRequest)
+			return
+		}
+
+		// Ensure parent directory exists
+		if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+			http.Error(w, "Failed to create directories", http.StatusInternalServerError)
+			return
+		}
+
+		file, err := os.Create(targetPath)
+		if err != nil {
+			http.Error(w, "Failed to create file: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer file.Close()
+
+		if _, err := io.Copy(file, r.Body); err != nil {
+			http.Error(w, "Failed to save file: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("File uploaded successfully"))
+	}
+}
+
+func MakeWorkspaceDownloadHandler(server *Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		if server.workspaceCurrent == "" {
+			http.Error(w, "No workspace set", http.StatusBadRequest)
+			return
+		}
+
+		filename := strings.TrimPrefix(r.URL.Path, "/workspace/download/")
+		if filename == "" {
+			http.Error(w, "Filename required", http.StatusBadRequest)
+			return
+		}
+
+		filePath := filepath.Join(server.workspaceCurrent, filename)
+		// Prevent path traversal
+		if !strings.HasPrefix(filePath, server.workspaceCurrent) {
+			http.Error(w, "Invalid path", http.StatusBadRequest)
+			return
+		}
+
+		file, err := os.Open(filePath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				http.Error(w, "File not found", http.StatusNotFound)
+			} else {
+				http.Error(w, "Failed to open file: "+err.Error(), http.StatusInternalServerError)
+			}
+			return
+		}
+		defer file.Close()
+
+		stat, err := file.Stat()
+		if err != nil {
+			http.Error(w, "Failed to get file info: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Disposition", "attachment; filename="+filepath.Base(filename))
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", strconv.FormatInt(stat.Size(), 10))
+		w.WriteHeader(http.StatusOK)
+
+		if _, err := io.Copy(w, file); err != nil {
+			log.Printf("Error while sending file: %v", err)
+		}
 	}
 }

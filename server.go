@@ -74,10 +74,10 @@ func NewServer(cfg config) *Server {
 	extMux.HandleFunc("/health", HealthHandler)
 	extMux.HandleFunc("/version", VersionHandler)
 	extMux.Handle("/exec/", authenticate(cfg.authToken, MakeExecHandler(cfg.ShellTemplates, &result)))
-	extMux.Handle("/upload", authenticate(cfg.authToken, http.HandlerFunc(UploadHandler)))
-	extMux.Handle("/download", authenticate(cfg.authToken, http.HandlerFunc(DownloadHandler)))
-	extMux.Handle("/ws", authenticate(cfg.authToken, http.HandlerFunc(result.proxy.HandleConnection)))
 	extMux.Handle("/workspace", authenticate(cfg.authToken, MakeWorkspaceHandler(&result)))
+	extMux.Handle("/workspace/upload/", authenticate(cfg.authToken, http.HandlerFunc(MakeWorkspaceUploadHandler(&result))))
+	extMux.Handle("/workspace/download/", authenticate(cfg.authToken, http.HandlerFunc(MakeWorkspaceDownloadHandler(&result))))
+	extMux.Handle("/ws", authenticate(cfg.authToken, http.HandlerFunc(result.proxy.HandleConnection)))
 
 	result.externalServer = &http.Server{
 		Handler: extMux,
