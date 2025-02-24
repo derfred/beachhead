@@ -92,9 +92,10 @@ func setupServerFlags(fs *flag.FlagSet, cfg *config) {
 	fs.StringVar(&cfg.Workspace, "workspace", os.Getenv("WORKSPACE"),
 		"Base workspace directory (env: WORKSPACE)")
 
-	var shells shellFlag
-	fs.Var(&shells, "shell", "Define shell command template in format name[@user]:template")
-	cfg.shellFlags = shells
+	fs.Func("shell", "Define shell command template in format name[@user]:template", func(s string) error {
+		cfg.shellFlags = append(cfg.shellFlags, s)
+		return nil
+	})
 }
 
 // new helper to parse a shell flag of form "name[@user]:template"
@@ -186,7 +187,7 @@ func loadConfig() config {
 		if cfg.authToken == "" {
 			log.Fatal("Authorization token not set")
 		}
-		processShellTemplates(&cfg) // process new shell template definitions
+		processShellTemplates(&cfg)
 
 	case "client":
 		clientCmd := flag.NewFlagSet("client", flag.ExitOnError)

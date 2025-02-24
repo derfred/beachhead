@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"math/rand"
 	"net/http"
 	"os"
@@ -41,7 +42,7 @@ func NewCommandExecutor(templates map[string]ShellTemplate) *CommandExecutor {
 	}
 }
 
-func (e *CommandExecutor) Execute(cmd string, args map[string]interface{}, w io.Writer) (int, error) {
+func (e *CommandExecutor) Execute(cwd string, cmd string, args map[string]interface{}, w io.Writer) (int, error) {
 	shellTmpl, exists := e.shellTemplates[cmd]
 	if !exists {
 		return 0, fmt.Errorf("command not found: %s", cmd)
@@ -63,7 +64,12 @@ func (e *CommandExecutor) Execute(cmd string, args map[string]interface{}, w io.
 		finalCmd = "sudo -u " + shellTmpl.User + " " + finalCmd
 	}
 
-	shellcmd := exec.Command("sh", "-c", finalCmd)
+	shellcmd := exec.Cmd{
+		Path: "/bin/sh",
+		Args: []string{"sh", "-c", finalCmd},
+		Dir:  cwd,
+	}
+
 	stdout, err := shellcmd.StdoutPipe()
 	if err != nil {
 		return 0, fmt.Errorf("failed to get stdout: %v", err)
@@ -78,8 +84,22 @@ func (e *CommandExecutor) Execute(cmd string, args map[string]interface{}, w io.
 	}
 
 	reader := io.MultiReader(stdout, stderr)
-	if _, err := io.Copy(w, reader); err != nil {
-		return 0, fmt.Errorf("failed to copy output: %v", err)
+	buf := make([]byte, 1024)
+	for {
+		n, err := reader.Read(buf)
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("error reading output: %v", err)
+			}
+			break
+		}
+		if _, err := w.Write(buf[:n]); err != nil {
+			log.Printf("error writing output: %v", err)
+			break
+		}
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
 	}
 
 	err = shellcmd.Wait()
@@ -122,7 +142,7 @@ func createTempFile(originalName string) (*os.File, error) {
 	return ioutil.TempFile(tempDir, prefix+"_*"+ext)
 }
 
-func extractCmdArgs(r *http.Request) (map[string]interface{}, error, int) {
+func extractCmdArgs(r *http.Request, workspaceBase string) (map[string]interface{}, error, int) {
 	var requestData map[string]interface{}
 
 	// Check the content type of the request
@@ -153,6 +173,7 @@ func extractCmdArgs(r *http.Request) (map[string]interface{}, error, int) {
 
 		// Initialize the request data map
 		requestData = make(map[string]interface{})
+		requestData["workspace"] = workspaceBase
 
 		// Parse the JSON data
 		jsonData := r.FormValue("json")
@@ -197,7 +218,7 @@ func extractCmdArgs(r *http.Request) (map[string]interface{}, error, int) {
 }
 
 // Replace ExecHandler with MakeExecHandler that uses a passed-in shellTemplates
-func MakeExecHandler(shellTemplates map[string]ShellTemplate) http.HandlerFunc {
+func MakeExecHandler(shellTemplates map[string]ShellTemplate, server *Server) http.HandlerFunc {
 	executor := NewCommandExecutor(shellTemplates)
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -211,7 +232,12 @@ func MakeExecHandler(shellTemplates map[string]ShellTemplate) http.HandlerFunc {
 			return
 		}
 
-		args, err, status := extractCmdArgs(r)
+		if _, exists := shellTemplates[cmd]; !exists {
+			http.Error(w, fmt.Sprintf("command not found: %s", cmd), http.StatusNotFound)
+			return
+		}
+
+		args, err, status := extractCmdArgs(r, server.workspaceBase)
 		if err != nil {
 			http.Error(w, err.Error(), status)
 			return
@@ -223,7 +249,7 @@ func MakeExecHandler(shellTemplates map[string]ShellTemplate) http.HandlerFunc {
 			f.Flush()
 		}
 
-		exitCode, err := executor.Execute(cmd, args, w)
+		exitCode, err := executor.Execute(server.workspaceCurrent, cmd, args, w)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -394,6 +420,9 @@ func MakeWorkspaceHandler(server *Server) http.HandlerFunc {
 				http.Error(w, "Failed to extract file: "+err.Error(), http.StatusInternalServerError)
 				return
 			}
+
+			// now set the workspaceCurrent to the new workspace
+			server.workspaceCurrent = tmpDir
 		}
 
 		// For future operations, the new workspace base is now tmpDir.
