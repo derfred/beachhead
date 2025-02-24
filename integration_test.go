@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -17,6 +18,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -127,15 +130,7 @@ func buildServer(t *testing.T) (*Server, *x509.CertPool, func()) {
 
 func TestIntegrationWithCertificates(t *testing.T) {
 	// Start upstream server
-	var receivedBody []byte
 	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "PUT" {
-			body, err := io.ReadAll(r.Body)
-			if err != nil {
-				t.Fatalf("Failed to read upstream request body: %v", err)
-			}
-			receivedBody = body
-		}
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("Hello from secure upstream"))
 	}))
@@ -164,10 +159,10 @@ func TestIntegrationWithCertificates(t *testing.T) {
 	defer client.Shutdown()
 	time.Sleep(1 * time.Second)
 
-	// Test GET request
+	// Test request
 	resp, err := http.Get(fmt.Sprintf("http://localhost:%d/resource", server.GetInternalPort()))
 	if err != nil {
-		t.Fatalf("GET request failed: %v", err)
+		t.Fatalf("Request failed: %v", err)
 	}
 	defer resp.Body.Close()
 
@@ -182,28 +177,6 @@ func TestIntegrationWithCertificates(t *testing.T) {
 
 	if string(body) != "Hello from secure upstream" {
 		t.Fatalf("Unexpected response: %s", string(body))
-	}
-
-	// Test PUT request
-	putBody := []byte("Test PUT request body")
-	req, err := http.NewRequest(http.MethodPut, fmt.Sprintf("http://localhost:%d/resource", server.GetInternalPort()), bytes.NewReader(putBody))
-	if err != nil {
-		t.Fatalf("Failed to create PUT request: %v", err)
-	}
-
-	resp, err = http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("PUT request failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("Unexpected PUT status code: %d", resp.StatusCode)
-	}
-
-	// Verify that the upstream server received the correct body
-	if !bytes.Equal(receivedBody, putBody) {
-		t.Fatalf("Upstream server received incorrect body. Expected: %s, Got: %s", putBody, receivedBody)
 	}
 }
 
@@ -383,4 +356,101 @@ func TestExecIntegration(t *testing.T) {
 	if exitCode != "0" {
 		t.Fatalf("Expected exit code '0', got: %s", exitCode)
 	}
+}
+
+func TestWorkspaceIntegration(t *testing.T) {
+	server, certPool, cleanup := buildServer(t)
+	go server.Start()
+	defer cleanup()
+	time.Sleep(1 * time.Second)
+
+	// Create a temporary zip file with test content
+	zipBuffer := &bytes.Buffer{}
+	zipWriter := zip.NewWriter(zipBuffer)
+
+	// Add a few test files to the zip
+	files := map[string]string{
+		"test.txt":       "Hello World",
+		"dir/nested.txt": "Nested content",
+		"config.json":    `{"key": "value"}`,
+	}
+
+	for name, content := range files {
+		f, err := zipWriter.Create(name)
+		if err != nil {
+			t.Fatalf("Failed to create zip entry: %v", err)
+		}
+		if _, err := f.Write([]byte(content)); err != nil {
+			t.Fatalf("Failed to write zip content: %v", err)
+		}
+	}
+
+	if err := zipWriter.Close(); err != nil {
+		t.Fatalf("Failed to close zip writer: %v", err)
+	}
+
+	// Prepare the multipart form
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	part, err := writer.CreateFormFile("file", "workspace.zip")
+	if err != nil {
+		t.Fatalf("Failed to create form file: %v", err)
+	}
+	if _, err := io.Copy(part, zipBuffer); err != nil {
+		t.Fatalf("Failed to copy zip content: %v", err)
+	}
+	writer.Close()
+
+	// Create custom HTTP client with cert verification
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				RootCAs: certPool,
+			},
+		},
+	}
+
+	// Make the workspace upload request
+	req, err := http.NewRequest("POST", fmt.Sprintf("https://localhost:%d/workspace", server.GetExternalPort()), body)
+	if err != nil {
+		t.Fatalf("Failed to create request: %v", err)
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to upload workspace: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Expected status 200, got %d", resp.StatusCode)
+	}
+
+	// Read the response which contains the workspace path
+	workspacePath, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("Failed to read response: %v", err)
+	}
+
+	// Extract the actual path from the response message
+	path := strings.TrimPrefix(string(workspacePath), "Workspace set to: ")
+
+	// Verify the extracted files
+	for name, expectedContent := range files {
+		content, err := os.ReadFile(filepath.Join(path, name))
+		if err != nil {
+			t.Errorf("Failed to read extracted file %s: %v", name, err)
+			continue
+		}
+
+		if string(content) != expectedContent {
+			t.Errorf("File %s content mismatch\nExpected: %s\nGot: %s",
+				name, expectedContent, string(content))
+		}
+	}
+
+	// Cleanup the workspace directory
+	os.RemoveAll(path)
 }

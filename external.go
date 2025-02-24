@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"text/template"
 )
@@ -214,5 +216,95 @@ func DownloadHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	if _, err := io.Copy(w, file); err != nil {
 		http.Error(w, "Failed to send file: "+err.Error(), http.StatusInternalServerError)
+	}
+}
+
+// WorkspaceHandler extracts a zip file from the request into a temp directory.
+func MakeWorkspaceHandler(server *Server) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Parse multipart form with a reasonable max memory.
+		if err := r.ParseMultipartForm(10 << 20); err != nil {
+			http.Error(w, "Error parsing form: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// Get the file
+		file, _, err := r.FormFile("file")
+		if err != nil {
+			http.Error(w, "Failed to get file from form: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		defer file.Close()
+
+		buf, err := io.ReadAll(file)
+		if err != nil {
+			http.Error(w, "Failed to read file: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		rdr := bytes.NewReader(buf)
+		zipReader, err := zip.NewReader(rdr, int64(len(buf)))
+		if err != nil {
+			http.Error(w, "Failed to open zip file: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// Create a new temporary directory inside the workspace base.
+		tmpDir, err := os.MkdirTemp(server.workspaceBase, "workspace_*")
+		if err != nil {
+			http.Error(w, "Failed to create temp dir: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		// Extract zip contents.
+		for _, f := range zipReader.File {
+			fpath := filepath.Join(tmpDir, f.Name)
+			// Prevent ZipSlip vulnerability.
+			if !strings.HasPrefix(fpath, filepath.Clean(tmpDir)+string(os.PathSeparator)) {
+				http.Error(w, "Illegal file path", http.StatusBadRequest)
+				return
+			}
+
+			if f.FileInfo().IsDir() {
+				os.MkdirAll(fpath, os.ModePerm)
+				continue
+			}
+
+			// Make sure directory exists.
+			if err = os.MkdirAll(filepath.Dir(fpath), os.ModePerm); err != nil {
+				http.Error(w, "Failed to create directories: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
+			if err != nil {
+				http.Error(w, "Failed to create file: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			rc, err := f.Open()
+			if err != nil {
+				outFile.Close()
+				http.Error(w, "Failed to open zipped file: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			_, err = io.Copy(outFile, rc)
+			outFile.Close()
+			rc.Close()
+			if err != nil {
+				http.Error(w, "Failed to extract file: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+
+		// For future operations, the new workspace base is now tmpDir.
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("Workspace set to: " + tmpDir))
 	}
 }

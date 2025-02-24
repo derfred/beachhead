@@ -30,6 +30,7 @@ type config struct {
 	caFile         string
 	shellFlags     []string
 	ShellTemplates map[string]ShellTemplate
+	Workspace      string
 }
 
 // Custom flag value to allow multiple -shell flags.
@@ -86,6 +87,8 @@ func setupServerFlags(fs *flag.FlagSet, cfg *config) {
 		"Path to certificate authority file (env: CA_FILE)")
 	fs.StringVar(&cfg.authToken, "auth-token", os.Getenv("AUTH_TOKEN"),
 		"Authorization token (env: AUTH_TOKEN)")
+	fs.StringVar(&cfg.Workspace, "workspace", os.Getenv("WORKSPACE"),
+		"Base workspace directory (env: WORKSPACE)")
 
 	var shells shellFlag
 	fs.Var(&shells, "shell", "Define shell command template in format name[@user]:template")

@@ -15,6 +15,8 @@ type Server struct {
 	externalTlsListener net.Listener
 	externalServer      *http.Server
 	proxy               *Proxy
+	workspaceBase       string
+	workspaceCurrent    string
 }
 
 func authenticate(authToken string, next http.Handler) http.Handler {
@@ -38,7 +40,10 @@ func authenticate(authToken string, next http.Handler) http.Handler {
 }
 
 func NewServer(cfg config) *Server {
-	proxy := NewProxy()
+	result := Server{
+		proxy:         NewProxy(),
+		workspaceBase: cfg.Workspace,
+	}
 
 	// Generate self-signed cert if not provided via env vars.
 	if err := GetOrGenerateCert(&cfg); err != nil {
@@ -50,12 +55,13 @@ func NewServer(cfg config) *Server {
 	if err != nil {
 		log.Fatalf("Failed to create external listener: %v", err)
 	}
+	result.externalListener = extListener
 
 	tlsConfig, err := cfg.makeTlsconfig()
 	if err != nil {
 		log.Fatalf("Failed to create TLS config: %v", err)
 	}
-	tlsListener := tls.NewListener(extListener, tlsConfig)
+	result.externalTlsListener = tls.NewListener(extListener, tlsConfig)
 
 	// Setup external HTTP server
 	extMux := http.NewServeMux()
@@ -64,35 +70,28 @@ func NewServer(cfg config) *Server {
 	extMux.Handle("/exec", authenticate(cfg.authToken, MakeExecHandler(cfg.ShellTemplates)))
 	extMux.Handle("/upload", authenticate(cfg.authToken, http.HandlerFunc(UploadHandler)))
 	extMux.Handle("/download", authenticate(cfg.authToken, http.HandlerFunc(DownloadHandler)))
-	extMux.Handle("/ws", authenticate(cfg.authToken, http.HandlerFunc(proxy.HandleConnection)))
+	extMux.Handle("/ws", authenticate(cfg.authToken, http.HandlerFunc(result.proxy.HandleConnection)))
+	extMux.Handle("/workspace", authenticate(cfg.authToken, MakeWorkspaceHandler(&result)))
 
-	extServer := &http.Server{
+	result.externalServer = &http.Server{
 		Handler: extMux,
 	}
 
 	// Setup internal HTTP server
 	intMux := http.NewServeMux()
-	intMux.HandleFunc("/", proxy.HandleRequest)
+	intMux.HandleFunc("/", result.proxy.HandleRequest)
 
 	// Create the internal listener
 	intListener, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.internalPort))
 	if err != nil {
 		log.Fatalf("Failed to create internal listener: %v", err)
 	}
-
-	intServer := &http.Server{
+	result.internalListener = intListener
+	result.internalServer = &http.Server{
 		Handler: intMux,
 	}
 
-	// Setup the result
-	return &Server{
-		internalListener:    intListener,
-		internalServer:      intServer,
-		externalListener:    extListener,
-		externalTlsListener: tlsListener,
-		externalServer:      extServer,
-		proxy:               proxy,
-	}
+	return &result
 }
 
 func (s *Server) Start() {
