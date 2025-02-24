@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"math/rand"
 	"net/http"
 	"os"
@@ -18,8 +19,8 @@ import (
 )
 
 type ExecRequest struct {
-	Cmd  string `json:"cmd"`
-	Args string `json:"args"`
+	Args  string          `json:"args"`
+	Files map[string]bool `json:"files"` // map of variable names that will be supplied as files
 }
 
 var version = "1.0.0"
@@ -40,7 +41,7 @@ func NewCommandExecutor(templates map[string]ShellTemplate) *CommandExecutor {
 	}
 }
 
-func (e *CommandExecutor) Execute(cmd, args string, w io.Writer) (int, error) {
+func (e *CommandExecutor) Execute(cmd string, args map[string]interface{}, w io.Writer) (int, error) {
 	shellTmpl, exists := e.shellTemplates[cmd]
 	if !exists {
 		return 0, fmt.Errorf("command not found: %s", cmd)
@@ -52,7 +53,7 @@ func (e *CommandExecutor) Execute(cmd, args string, w io.Writer) (int, error) {
 	}
 
 	var cmdStr bytes.Buffer
-	err = tmpl.Execute(&cmdStr, map[string]string{"Args": args})
+	err = tmpl.Execute(&cmdStr, args)
 	if err != nil {
 		return 0, fmt.Errorf("template execution error: %v", err)
 	}
@@ -103,24 +104,116 @@ func VersionHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(version))
 }
 
+func isMultipartFormRequest(contentType string) bool {
+	return len(contentType) >= 19 && contentType[:19] == "multipart/form-data"
+}
+
+func createTempFile(originalName string) (*os.File, error) {
+	// Create a temporary directory if it doesn't exist
+	tempDir := filepath.Join(os.TempDir(), "uploads")
+	if err := os.MkdirAll(tempDir, 0755); err != nil {
+		return nil, err
+	}
+
+	// Create a temporary file with the original filename pattern
+	ext := filepath.Ext(originalName)
+	prefix := originalName[:len(originalName)-len(ext)]
+
+	return ioutil.TempFile(tempDir, prefix+"_*"+ext)
+}
+
+func extractCmdArgs(r *http.Request) (map[string]interface{}, error, int) {
+	var requestData map[string]interface{}
+
+	// Check the content type of the request
+	contentType := r.Header.Get("Content-Type")
+
+	// Handle JSON request
+	if contentType == "application/json" {
+		// Read the request body
+		body, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			return nil, err, http.StatusInternalServerError
+		}
+		defer r.Body.Close()
+
+		// Unmarshal the JSON into a nested map
+		err = json.Unmarshal(body, &requestData)
+		if err != nil {
+			return nil, err, http.StatusBadRequest
+		}
+		return requestData, nil, http.StatusOK
+	} else if isMultipartFormRequest(contentType) {
+		// Handle multipart form request
+		// Parse the multipart form with a reasonable max memory
+		err := r.ParseMultipartForm(10 << 20) // 10 MB max memory
+		if err != nil {
+			return nil, err, http.StatusBadRequest
+		}
+
+		// Initialize the request data map
+		requestData = make(map[string]interface{})
+
+		// Parse the JSON data
+		jsonData := r.FormValue("json")
+		if jsonData != "" {
+			err = json.Unmarshal([]byte(jsonData), &requestData)
+			if err != nil {
+				return nil, err, http.StatusBadRequest
+			}
+		}
+
+		// Process any additional file uploads
+		for fileName, fileHeaders := range r.MultipartForm.File {
+			for _, fileHeader := range fileHeaders {
+				// Open the uploaded file
+				file, err := fileHeader.Open()
+				if err != nil {
+					return nil, err, http.StatusInternalServerError
+				}
+				defer file.Close()
+
+				// Create a temporary file to store the upload
+				tempFile, err := createTempFile(fileHeader.Filename)
+				if err != nil {
+					return nil, err, http.StatusInternalServerError
+				}
+				defer tempFile.Close()
+
+				// Copy the uploaded file to the temporary file
+				_, err = io.Copy(tempFile, file)
+				if err != nil {
+					return nil, err, http.StatusInternalServerError
+				}
+
+				// Add the file location to the request data map
+				requestData[fileName] = tempFile.Name()
+			}
+		}
+		return requestData, nil, http.StatusOK
+	} else {
+		return nil, fmt.Errorf("unsupported content type. Use application/json or multipart/form-data"), http.StatusUnsupportedMediaType
+	}
+}
+
 // Replace ExecHandler with MakeExecHandler that uses a passed-in shellTemplates
 func MakeExecHandler(shellTemplates map[string]ShellTemplate) http.HandlerFunc {
 	executor := NewCommandExecutor(shellTemplates)
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Only accept POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
-		var req ExecRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid JSON request: "+err.Error(), http.StatusBadRequest)
+		cmd := strings.TrimPrefix(r.URL.Path, "/exec/")
+		if cmd == "" {
+			http.Error(w, "command name is required", http.StatusBadRequest)
 			return
 		}
 
-		if req.Cmd == "" {
-			http.Error(w, "cmd field is required", http.StatusBadRequest)
+		args, err, status := extractCmdArgs(r)
+		if err != nil {
+			http.Error(w, err.Error(), status)
 			return
 		}
 
@@ -130,7 +223,7 @@ func MakeExecHandler(shellTemplates map[string]ShellTemplate) http.HandlerFunc {
 			f.Flush()
 		}
 
-		exitCode, err := executor.Execute(req.Cmd, req.Args, w)
+		exitCode, err := executor.Execute(cmd, args, w)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -222,7 +315,7 @@ func DownloadHandler(w http.ResponseWriter, r *http.Request) {
 // WorkspaceHandler extracts a zip file from the request into a temp directory.
 func MakeWorkspaceHandler(server *Server) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
+		if r.Method != http.MethodPut {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}

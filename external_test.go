@@ -39,7 +39,7 @@ func TestVersionHandler(t *testing.T) {
 
 func TestCommandExecutor_Execute(t *testing.T) {
 	templates := map[string]ShellTemplate{
-		"echo": {Template: "echo {{.Args}}"},
+		"echo": {Template: "echo {{.text}}"},
 		"root": {User: "root", Template: "whoami"},
 	}
 
@@ -48,14 +48,14 @@ func TestCommandExecutor_Execute(t *testing.T) {
 	tests := []struct {
 		name    string
 		cmd     string
-		args    string
+		args    map[string]interface{}
 		wantOut string
 		wantErr bool
 	}{
 		{
 			name:    "basic command",
 			cmd:     "echo",
-			args:    "hello",
+			args:    map[string]interface{}{"text": "hello"},
 			wantOut: "hello\n",
 		},
 		{

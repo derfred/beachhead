@@ -70,7 +70,7 @@ func GenerateTestCert(host string) (*x509.Certificate, any, error) {
 	return cert, privKey, nil
 }
 
-func buildServer(t *testing.T) (*Server, *x509.CertPool, func()) {
+func buildServer(t *testing.T, cmds map[string]ShellTemplate) (*Server, *x509.CertPool, func()) {
 	// Generate test certificates
 	cert, privKey, err := GenerateTestCert("localhost")
 	if err != nil {
@@ -112,12 +112,13 @@ func buildServer(t *testing.T) (*Server, *x509.CertPool, func()) {
 
 	// Start WebTransport server with certs
 	cfg := config{
-		internalPort: 0,
-		externalPort: 0,
-		authToken:    "test-token",
-		mode:         "server",
-		certFile:     certFile.Name(),
-		keyFile:      keyFile.Name(),
+		internalPort:   0,
+		externalPort:   0,
+		authToken:      "test-token",
+		mode:           "server",
+		certFile:       certFile.Name(),
+		keyFile:        keyFile.Name(),
+		ShellTemplates: cmds,
 	}
 	server := NewServer(cfg)
 	cleanup := func() {
@@ -136,7 +137,7 @@ func TestIntegrationWithCertificates(t *testing.T) {
 	}))
 	defer upstreamServer.Close()
 
-	server, certPool, cleanup := buildServer(t)
+	server, certPool, cleanup := buildServer(t, nil)
 	go server.Start()
 	defer cleanup()
 
@@ -181,7 +182,7 @@ func TestIntegrationWithCertificates(t *testing.T) {
 }
 
 func TestUploadDownloadIntegration(t *testing.T) {
-	server, certPool, cleanup := buildServer(t)
+	server, certPool, cleanup := buildServer(t, nil)
 	go server.Start()
 	defer cleanup()
 	time.Sleep(1 * time.Second)
@@ -261,59 +262,18 @@ func TestUploadDownloadIntegration(t *testing.T) {
 }
 
 func TestExecIntegration(t *testing.T) {
-	// Generate test certificates (similar to buildServer)
-	cert, privKey, err := GenerateTestCert("localhost")
-	if err != nil {
-		t.Fatalf("Failed to generate test certificate: %v", err)
-	}
-	certPool := x509.NewCertPool()
-	certPool.AddCert(cert)
-
-	certFile, err := os.CreateTemp("", "cert")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.Remove(certFile.Name())
-	keyFile, err := os.CreateTemp("", "key")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.Remove(keyFile.Name())
-	if err := pem.Encode(certFile, &pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw}); err != nil {
-		t.Fatal(err)
-	}
-	privKeyBytes, err := x509.MarshalPKCS8PrivateKey(privKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := pem.Encode(keyFile, &pem.Block{Type: "PRIVATE KEY", Bytes: privKeyBytes}); err != nil {
-		t.Fatal(err)
-	}
-	certFile.Close()
-	keyFile.Close()
-
-	// Setup server config with a shell template for exec.
-	cfg := config{
-		internalPort: 0,
-		externalPort: 0,
-		authToken:    "test-token",
-		mode:         "server",
-		certFile:     certFile.Name(),
-		keyFile:      keyFile.Name(),
-		ShellTemplates: map[string]ShellTemplate{
-			"echo": {Template: "echo {{.Args}}"},
-		},
-	}
-	server := NewServer(cfg)
+	server, certPool, cleanup := buildServer(t, map[string]ShellTemplate{
+		"echo": {Template: "echo {{.args}}"},
+	})
 	go server.Start()
 	defer server.Shutdown()
+	defer cleanup()
 
 	// Wait briefly for the server to start.
 	time.Sleep(500 * time.Millisecond)
 
 	// Prepare the exec request.
 	reqBody, err := json.Marshal(map[string]string{
-		"cmd":  "echo",
 		"args": "Hello Exec",
 	})
 	if err != nil {
@@ -327,7 +287,7 @@ func TestExecIntegration(t *testing.T) {
 		},
 	}
 
-	execURL := fmt.Sprintf("https://localhost:%d/exec", server.GetExternalPort())
+	execURL := fmt.Sprintf("https://localhost:%d/exec/echo", server.GetExternalPort())
 	req, err := http.NewRequest(http.MethodPost, execURL, bytes.NewBuffer(reqBody))
 	if err != nil {
 		t.Fatalf("Failed to create request: %v", err)
@@ -358,8 +318,96 @@ func TestExecIntegration(t *testing.T) {
 	}
 }
 
+func TestExecWithFilesIntegration(t *testing.T) {
+	// Generate test certificates and start server
+	server, certPool, cleanup := buildServer(t, map[string]ShellTemplate{
+		"cat": {Template: "cat {{.input}}"},
+	})
+
+	go server.Start()
+	defer cleanup()
+	time.Sleep(1 * time.Second)
+
+	// Create a test file with content
+	testContent := "Hello from test file"
+	tmpFile, err := os.CreateTemp("", "test-*.txt")
+	if err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err := tmpFile.WriteString(testContent); err != nil {
+		t.Fatalf("Failed to write test content: %v", err)
+	}
+	tmpFile.Close()
+
+	// Prepare the multipart request
+	var b bytes.Buffer
+	writer := multipart.NewWriter(&b)
+
+	// Add the file
+	file, err := os.Open(tmpFile.Name())
+	if err != nil {
+		t.Fatalf("Failed to open test file: %v", err)
+	}
+	defer file.Close()
+
+	filePart, err := writer.CreateFormFile("input", "input.txt")
+	if err != nil {
+		t.Fatalf("Failed to create form file: %v", err)
+	}
+	if _, err := io.Copy(filePart, file); err != nil {
+		t.Fatalf("Failed to copy file content: %v", err)
+	}
+	writer.Close()
+
+	// Create HTTPS client
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				RootCAs: certPool,
+			},
+		},
+	}
+
+	// Make the request
+	url := fmt.Sprintf("https://localhost:%d/exec/cat", server.GetExternalPort())
+	req, err := http.NewRequest(http.MethodPost, url, &b)
+	if err != nil {
+		t.Fatalf("Failed to create request: %v", err)
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Expected status 200, got %d", resp.StatusCode)
+	}
+
+	// Read and verify the response
+	output, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("Failed to read response: %v", err)
+	}
+
+	expectedOutput := testContent + " additional args"
+	if !strings.Contains(string(output), testContent) {
+		t.Errorf("Expected output to contain %q, got %q", expectedOutput, string(output))
+	}
+
+	exitCode := resp.Trailer.Get("X-Exit-Code")
+	if exitCode != "0" {
+		t.Errorf("Expected exit code 0, got %s", exitCode)
+	}
+}
+
 func TestWorkspaceIntegration(t *testing.T) {
-	server, certPool, cleanup := buildServer(t)
+	server, certPool, cleanup := buildServer(t, nil)
 	go server.Start()
 	defer cleanup()
 	time.Sleep(1 * time.Second)
@@ -411,7 +459,7 @@ func TestWorkspaceIntegration(t *testing.T) {
 	}
 
 	// Make the workspace upload request
-	req, err := http.NewRequest("POST", fmt.Sprintf("https://localhost:%d/workspace", server.GetExternalPort()), body)
+	req, err := http.NewRequest("PUT", fmt.Sprintf("https://localhost:%d/workspace", server.GetExternalPort()), body)
 	if err != nil {
 		t.Fatalf("Failed to create request: %v", err)
 	}

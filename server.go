@@ -46,8 +46,12 @@ func NewServer(cfg config) *Server {
 	}
 
 	// Generate self-signed cert if not provided via env vars.
-	if err := GetOrGenerateCert(&cfg); err != nil {
+	generated, err := GetOrGenerateCert(&cfg)
+	if err != nil {
 		log.Fatalf("Error generating certificate: %v", err)
+	}
+	if generated {
+		log.Printf("Using self-signed certificate @ %s", cfg.certFile)
 	}
 
 	// Setup external HTTPS server with listener first
@@ -57,17 +61,19 @@ func NewServer(cfg config) *Server {
 	}
 	result.externalListener = extListener
 
-	tlsConfig, err := cfg.makeTlsconfig()
-	if err != nil {
-		log.Fatalf("Failed to create TLS config: %v", err)
+	if !cfg.useHttp {
+		tlsConfig, err := cfg.makeTlsconfig()
+		if err != nil {
+			log.Fatalf("Failed to create TLS config: %v", err)
+		}
+		result.externalTlsListener = tls.NewListener(extListener, tlsConfig)
 	}
-	result.externalTlsListener = tls.NewListener(extListener, tlsConfig)
 
 	// Setup external HTTP server
 	extMux := http.NewServeMux()
 	extMux.HandleFunc("/health", HealthHandler)
 	extMux.HandleFunc("/version", VersionHandler)
-	extMux.Handle("/exec", authenticate(cfg.authToken, MakeExecHandler(cfg.ShellTemplates)))
+	extMux.Handle("/exec/", authenticate(cfg.authToken, MakeExecHandler(cfg.ShellTemplates)))
 	extMux.Handle("/upload", authenticate(cfg.authToken, http.HandlerFunc(UploadHandler)))
 	extMux.Handle("/download", authenticate(cfg.authToken, http.HandlerFunc(DownloadHandler)))
 	extMux.Handle("/ws", authenticate(cfg.authToken, http.HandlerFunc(result.proxy.HandleConnection)))
@@ -82,7 +88,7 @@ func NewServer(cfg config) *Server {
 	intMux.HandleFunc("/", result.proxy.HandleRequest)
 
 	// Create the internal listener
-	intListener, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.internalPort))
+	intListener, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", cfg.internalPort))
 	if err != nil {
 		log.Fatalf("Failed to create internal listener: %v", err)
 	}
@@ -103,7 +109,12 @@ func (s *Server) Start() {
 	}()
 
 	log.Printf("Starting external HTTPS server on %s", s.externalListener.Addr().String())
-	if err := s.externalServer.Serve(s.externalTlsListener); err != nil && err != http.ErrServerClosed {
+
+	extListener := s.externalListener
+	if s.externalTlsListener != nil {
+		extListener = s.externalTlsListener
+	}
+	if err := s.externalServer.Serve(extListener); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("External server error: %v", err)
 	}
 }

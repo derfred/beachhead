@@ -20,6 +20,7 @@ type ShellTemplate struct {
 type config struct {
 	internalPort   int
 	externalPort   int
+	useHttp        bool
 	authToken      string
 	endpoint       string
 	upstream       string
@@ -79,6 +80,7 @@ func setupServerFlags(fs *flag.FlagSet, cfg *config) {
 		"External HTTPS server port (env: EXTERNAL_PORT)")
 	fs.BoolVar(&cfg.skipVerify, "skip-verify", os.Getenv("SKIP_VERIFY") == "true",
 		"Skip TLS certificate verification (env: SKIP_VERIFY)")
+	fs.BoolVar(&cfg.useHttp, "use-http", false, "Don't use TLS on the external interface")
 	fs.StringVar(&cfg.certFile, "cert-file", os.Getenv("SSL_CERT"),
 		"Path to SSL certificate file (env: SSL_CERT)")
 	fs.StringVar(&cfg.keyFile, "key-file", os.Getenv("SSL_KEY"),
@@ -259,6 +261,12 @@ func main() {
 	if cfg.mode == "client" {
 		RunClient(cfg)
 	} else {
+		if cfg.Workspace != "" {
+			if err := os.MkdirAll(cfg.Workspace, 0755); err != nil {
+				log.Fatalf("Failed to create workspace directory: %v", err)
+			}
+		}
+
 		server := NewServer(cfg)
 		server.Start()
 	}
