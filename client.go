@@ -38,7 +38,7 @@ func NewWebSocketClient(endpoint string, token string, upstream string, tlsClien
 
 	conn, _, err := dialer.Dial(endpoint, headers)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("websocket connection failed: %v", err)
 	}
 
 	client := &WebSocketClient{
@@ -52,8 +52,12 @@ func NewWebSocketClient(endpoint string, token string, upstream string, tlsClien
 
 // AcceptMessages accepts and handles incoming messages on the connection.
 func (client *WebSocketClient) AcceptMessages() {
+	headerBuffer := bytes.Buffer{}
+	bodyBuffer := bytes.Buffer{}
+	current := &headerBuffer
+
 	for {
-		_, message, err := client.conn.ReadMessage()
+		messageType, message, err := client.conn.ReadMessage()
 		if err != nil {
 			var closeErr *websocket.CloseError
 			if errors.As(err, &closeErr) && closeErr.Code == websocket.CloseNormalClosure {
@@ -64,40 +68,41 @@ func (client *WebSocketClient) AcceptMessages() {
 			return
 		}
 
-		client.msgBuffer.Write(message)
+		if messageType == websocket.BinaryMessage {
+			current.Write(message)
+		} else {
+			log.Printf("Received text message: %s", message)
+			if bytes.Equal(message, []byte("HeaderComplete")) {
+				current = &bodyBuffer
+			} else if bytes.Equal(message, []byte("RequestComplete")) {
+				client.handleRequest(&headerBuffer, &bodyBuffer)
 
-		// Try to parse the accumulated buffer as an HTTP request
-		bufReader := bufio.NewReader(&client.msgBuffer)
-		req, err := http.ReadRequest(bufReader)
-
-		if err != nil {
-			// If we can't parse a complete request yet, wait for more data
-			if err == bufio.ErrBufferFull || errors.Is(err, io.ErrUnexpectedEOF) {
-				continue
+				// get ready for next request
+				headerBuffer.Reset()
+				bodyBuffer.Reset()
+				current = &headerBuffer
 			}
-
-			// Other parsing error, reset buffer and log
-			log.Printf("Error parsing request: %v", err)
-			client.msgBuffer.Reset()
-			continue
 		}
-
-		// Successfully parsed a complete request
-		// Clear the buffer and process the request
-		client.msgBuffer.Reset()
-
-		// Handle the complete request synchronously
-		client.handleRequest(req)
 	}
 }
 
 // handleRequest processes a complete HTTP request and proxies it to the upstream server.
-func (client *WebSocketClient) handleRequest(req *http.Request) {
+func (client *WebSocketClient) handleRequest(headerBuffer *bytes.Buffer, bodyBuffer *bytes.Buffer) {
+	req, err := http.ReadRequest(bufio.NewReader(headerBuffer))
+	if err != nil {
+		log.Printf("Error reading request: %v", err)
+		return
+	}
+
+	// Set the body if bodyBuffer is not empty
+	if bodyBuffer.Len() > 0 {
+		req.Body = io.NopCloser(bytes.NewReader(bodyBuffer.Bytes()))
+		req.ContentLength = int64(bodyBuffer.Len())
+	}
+
 	req.URL.Scheme = client.upstreamURL.Scheme
 	req.URL.Host = client.upstreamURL.Host
 	req.RequestURI = ""
-
-	log.Printf("Forwarding request to %s", req.URL.String())
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -105,6 +110,8 @@ func (client *WebSocketClient) handleRequest(req *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
+
+	log.Printf("Forwarded request to %s %s -> %d", req.Method, req.URL.String(), resp.StatusCode)
 
 	client.msgMutex.Lock()
 	defer client.msgMutex.Unlock()

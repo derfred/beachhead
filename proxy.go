@@ -117,6 +117,55 @@ func (p *Proxy) HandleConnection(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func sendRequest(r *http.Request, ws *websocket.Conn) error {
+	// Proxy the request to the websocket client
+	var reqBuilder strings.Builder
+	reqBuilder.WriteString(fmt.Sprintf("%s %s %s\n", r.Method, r.URL.String(), r.Proto))
+	for key, values := range r.Header {
+		for _, value := range values {
+			reqBuilder.WriteString(fmt.Sprintf("%s: %s\n", key, value))
+		}
+	}
+	reqBuilder.WriteString("\n")
+
+	// Write headers first
+	if err := ws.WriteMessage(websocket.BinaryMessage, []byte(reqBuilder.String())); err != nil {
+		return fmt.Errorf("failed to write to WebSocket: %w", err)
+	}
+
+	// Stream the body in chunks if present
+	if r.Body != nil {
+		// Tell the client that the headers are complete
+		if err := ws.WriteMessage(websocket.TextMessage, []byte("HeaderComplete")); err != nil {
+			return fmt.Errorf("failed to write to WebSocket: %w", err)
+		}
+
+		buffer := make([]byte, 32*1024) // 32KB buffer
+		for {
+			n, err := r.Body.Read(buffer)
+			if err != nil && err != io.EOF {
+				return fmt.Errorf("failed to read request body: %w", err)
+			}
+			if n > 0 {
+				// Send the chunk as a binary message
+				if err := ws.WriteMessage(websocket.BinaryMessage, buffer[:n]); err != nil {
+					return fmt.Errorf("failed to write to WebSocket: %w", err)
+				}
+			}
+			if err == io.EOF {
+				break
+			}
+		}
+	}
+
+	// Tell the client that the request is complete
+	if err := ws.WriteMessage(websocket.TextMessage, []byte("RequestComplete")); err != nil {
+		return fmt.Errorf("failed to write to WebSocket: %w", err)
+	}
+
+	return nil
+}
+
 func (p *Proxy) HandleRequest(w http.ResponseWriter, r *http.Request) {
 	// Check if a websocket client is connected
 	p.mutex.Lock()
@@ -128,23 +177,9 @@ func (p *Proxy) HandleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Proxy the request to the websocket client
-	var reqBuilder strings.Builder
-	reqBuilder.WriteString(fmt.Sprintf("%s %s %s\n", r.Method, r.URL.String(), r.Proto))
-	for key, values := range r.Header {
-		for _, value := range values {
-			reqBuilder.WriteString(fmt.Sprintf("%s: %s\n", key, value))
-		}
-	}
-	reqBuilder.WriteString("\n")
-
-	if err := ws.WriteMessage(websocket.BinaryMessage, []byte(reqBuilder.String())); err != nil {
-		http.Error(w, "Failed to write to WebSocket: "+err.Error(), http.StatusInternalServerError)
+	if err := sendRequest(r, ws); err != nil {
+		http.Error(w, "Failed to proxy request: "+err.Error(), http.StatusInternalServerError)
 		return
-	}
-
-	if r.Body != nil {
-		io.Copy(ws.UnderlyingConn(), r.Body)
 	}
 
 	var headerBuf bytes.Buffer
@@ -162,7 +197,7 @@ func (p *Proxy) HandleRequest(w http.ResponseWriter, r *http.Request) {
 				headerData := headerBuf.Bytes()[:i]
 				remainingData := headerBuf.Bytes()[i+4:]
 
-				if err := parseHeaders(string(headerData), w); err != nil {
+				if err := returnResponseHeader(string(headerData), w); err != nil {
 					http.Error(w, "Invalid response headers: "+err.Error(), http.StatusInternalServerError)
 					return
 				}
@@ -200,7 +235,7 @@ func (p *Proxy) HandleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func parseHeaders(headerData string, w http.ResponseWriter) error {
+func returnResponseHeader(headerData string, w http.ResponseWriter) error {
 	lines := strings.Split(headerData, "\r\n")
 	if len(lines) == 0 {
 		return fmt.Errorf("no headers found")

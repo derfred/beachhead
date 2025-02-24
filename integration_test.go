@@ -127,7 +127,15 @@ func buildServer(t *testing.T) (*Server, *x509.CertPool, func()) {
 
 func TestIntegrationWithCertificates(t *testing.T) {
 	// Start upstream server
+	var receivedBody []byte
 	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "PUT" {
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("Failed to read upstream request body: %v", err)
+			}
+			receivedBody = body
+		}
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("Hello from secure upstream"))
 	}))
@@ -156,10 +164,10 @@ func TestIntegrationWithCertificates(t *testing.T) {
 	defer client.Shutdown()
 	time.Sleep(1 * time.Second)
 
-	// Test request
+	// Test GET request
 	resp, err := http.Get(fmt.Sprintf("http://localhost:%d/resource", server.GetInternalPort()))
 	if err != nil {
-		t.Fatalf("Request failed: %v", err)
+		t.Fatalf("GET request failed: %v", err)
 	}
 	defer resp.Body.Close()
 
@@ -174,6 +182,28 @@ func TestIntegrationWithCertificates(t *testing.T) {
 
 	if string(body) != "Hello from secure upstream" {
 		t.Fatalf("Unexpected response: %s", string(body))
+	}
+
+	// Test PUT request
+	putBody := []byte("Test PUT request body")
+	req, err := http.NewRequest(http.MethodPut, fmt.Sprintf("http://localhost:%d/resource", server.GetInternalPort()), bytes.NewReader(putBody))
+	if err != nil {
+		t.Fatalf("Failed to create PUT request: %v", err)
+	}
+
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("PUT request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Unexpected PUT status code: %d", resp.StatusCode)
+	}
+
+	// Verify that the upstream server received the correct body
+	if !bytes.Equal(receivedBody, putBody) {
+		t.Fatalf("Upstream server received incorrect body. Expected: %s, Got: %s", putBody, receivedBody)
 	}
 }
 
