@@ -71,7 +71,6 @@ func (client *WebSocketClient) AcceptMessages() {
 		if messageType == websocket.BinaryMessage {
 			current.Write(message)
 		} else {
-			log.Printf("Received text message: %s", message)
 			if bytes.Equal(message, []byte("HeaderComplete")) {
 				current = &bodyBuffer
 			} else if bytes.Equal(message, []byte("RequestComplete")) {
