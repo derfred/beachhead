@@ -33,7 +33,7 @@ jobs:
           GOOS: ${{ matrix.platform }}
           GOARCH: ${{ matrix.arch }}
         run: |
-          go build -o ${{ matrix.artifact }} .
+          go build -o beachhead-${{ matrix.platform }}-${{ matrix.arch }} .
 
       - name: Create GitHub Release
         id: create_release
