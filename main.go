@@ -34,18 +34,6 @@ type config struct {
 	Workspace      string
 }
 
-// Custom flag value to allow multiple -shell flags.
-type shellFlag []string
-
-func (s *shellFlag) String() string {
-	return strings.Join(*s, ",")
-}
-
-func (s *shellFlag) Set(value string) error {
-	*s = append(*s, value)
-	return nil
-}
-
 func (c config) makeTlsconfig() (*tls.Config, error) {
 	if c.certFile == "" || c.keyFile == "" {
 		return nil, fmt.Errorf("certificate and key files are required")
@@ -182,7 +170,9 @@ func loadConfig() config {
 	case "server":
 		serverCmd := flag.NewFlagSet("server", flag.ExitOnError)
 		setupServerFlags(serverCmd, &cfg)
-		serverCmd.Parse(os.Args[2:])
+		if err := serverCmd.Parse(os.Args[2:]); err != nil {
+			log.Fatalf("Error parsing server command: %v", err)
+		}
 
 		if cfg.authToken == "" {
 			log.Fatal("Authorization token not set")
@@ -192,7 +182,9 @@ func loadConfig() config {
 	case "client":
 		clientCmd := flag.NewFlagSet("client", flag.ExitOnError)
 		setupClientFlags(clientCmd, &cfg)
-		clientCmd.Parse(os.Args[2:])
+		if err := clientCmd.Parse(os.Args[2:]); err != nil {
+			log.Fatalf("Error parsing client command: %v", err)
+		}
 
 		if cfg.authToken == "" {
 			log.Fatal("Authorization token not set")

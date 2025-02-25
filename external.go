@@ -6,16 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
-	"math/rand"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"text/template"
 )
 
@@ -25,12 +22,6 @@ type ExecRequest struct {
 }
 
 var version = "1.0.0"
-
-var (
-	// Global variable to hold the WebSocket connection
-	fileMap     = make(map[string]string)
-	fileMapLock sync.Mutex
-)
 
 type CommandExecutor struct {
 	shellTemplates map[string]ShellTemplate
@@ -139,7 +130,7 @@ func createTempFile(originalName string) (*os.File, error) {
 	ext := filepath.Ext(originalName)
 	prefix := originalName[:len(originalName)-len(ext)]
 
-	return ioutil.TempFile(tempDir, prefix+"_*"+ext)
+	return os.CreateTemp(tempDir, prefix+"_*"+ext)
 }
 
 func extractCmdArgs(r *http.Request, workspaceBase string) (map[string]interface{}, error, int) {
@@ -151,7 +142,7 @@ func extractCmdArgs(r *http.Request, workspaceBase string) (map[string]interface
 	// Handle JSON request
 	if contentType == "application/json" {
 		// Read the request body
-		body, err := ioutil.ReadAll(r.Body)
+		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			return nil, err, http.StatusInternalServerError
 		}
@@ -256,15 +247,6 @@ func MakeExecHandler(shellTemplates map[string]ShellTemplate, server *Server) ht
 		}
 		w.Header().Set("X-Exit-Code", strconv.Itoa(exitCode))
 	}
-}
-
-func generateRandomID() string {
-	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	b := make([]byte, 16)
-	for i := range b {
-		b[i] = letters[rand.Intn(len(letters))]
-	}
-	return string(b)
 }
 
 // WorkspaceHandler extracts a zip file from the request into a temp directory.
