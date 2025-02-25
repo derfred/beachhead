@@ -21,6 +21,7 @@ type WebSocketClient struct {
 	upstreamURL *url.URL
 	msgMutex    sync.Mutex
 	msgBuffer   bytes.Buffer
+	done        chan struct{}
 }
 
 // NewWebSocketClient initializes a new WebSocketClient.
@@ -45,6 +46,7 @@ func NewWebSocketClient(endpoint string, token string, upstream string, tlsClien
 		conn:        conn,
 		upstreamURL: upstreamURL,
 		msgBuffer:   bytes.Buffer{},
+		done:        make(chan struct{}),
 	}
 
 	return client, nil
@@ -57,29 +59,34 @@ func (client *WebSocketClient) AcceptMessages() {
 	current := &headerBuffer
 
 	for {
-		messageType, message, err := client.conn.ReadMessage()
-		if err != nil {
-			var closeErr *websocket.CloseError
-			if errors.As(err, &closeErr) && closeErr.Code == websocket.CloseNormalClosure {
+		select {
+		case <-client.done:
+			return
+		default:
+			messageType, message, err := client.conn.ReadMessage()
+			if err != nil {
+				var closeErr *websocket.CloseError
+				if errors.As(err, &closeErr) && closeErr.Code == websocket.CloseNormalClosure {
+					return
+				}
+
+				log.Printf("Error accepting message: %v", err)
 				return
 			}
 
-			log.Printf("Error accepting message: %v", err)
-			return
-		}
+			if messageType == websocket.BinaryMessage {
+				current.Write(message)
+			} else {
+				if bytes.Equal(message, []byte("HeaderComplete")) {
+					current = &bodyBuffer
+				} else if bytes.Equal(message, []byte("RequestComplete")) {
+					client.handleRequest(&headerBuffer, &bodyBuffer)
 
-		if messageType == websocket.BinaryMessage {
-			current.Write(message)
-		} else {
-			if bytes.Equal(message, []byte("HeaderComplete")) {
-				current = &bodyBuffer
-			} else if bytes.Equal(message, []byte("RequestComplete")) {
-				client.handleRequest(&headerBuffer, &bodyBuffer)
-
-				// get ready for next request
-				headerBuffer.Reset()
-				bodyBuffer.Reset()
-				current = &headerBuffer
+					// get ready for next request
+					headerBuffer.Reset()
+					bodyBuffer.Reset()
+					current = &headerBuffer
+				}
 			}
 		}
 	}
@@ -129,5 +136,10 @@ func (client *WebSocketClient) handleRequest(headerBuffer *bytes.Buffer, bodyBuf
 
 // Shutdown gracefully closes the WebSocket connection.
 func (client *WebSocketClient) Shutdown() error {
+	// Signal AcceptMessages to stop
+	close(client.done)
+
+	client.msgMutex.Lock()
+	defer client.msgMutex.Unlock()
 	return client.conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Shutdown"))
 }
