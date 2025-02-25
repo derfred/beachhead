@@ -21,7 +21,7 @@ type ExecRequest struct {
 	Files map[string]bool `json:"files"` // map of variable names that will be supplied as files
 }
 
-var version = "1.0.0"
+var version = "0.1"
 
 type CommandExecutor struct {
 	shellTemplates map[string]ShellTemplate
