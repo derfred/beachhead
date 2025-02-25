@@ -56,6 +56,14 @@ func NewProxy() *Proxy {
 }
 
 func (p *Proxy) HandleConnection(w http.ResponseWriter, r *http.Request) {
+	p.mutex.Lock()
+	// Check if a websocket client is already connected
+	if p.ws != nil {
+		p.mutex.Unlock()
+		http.Error(w, "Websocket client already connected", http.StatusConflict)
+		return
+	}
+
 	// Upgrade the connection to a websocket
 	ws, err := p.upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -64,13 +72,6 @@ func (p *Proxy) HandleConnection(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Set the websocket connection
-	p.mutex.Lock()
-	// Check if a websocket client is already connected
-	if p.ws != nil {
-		p.mutex.Unlock()
-		http.Error(w, "Websocket client already connected", http.StatusConflict)
-		return
-	}
 	p.ws = ws
 	p.mutex.Unlock()
 
