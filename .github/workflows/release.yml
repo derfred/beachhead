@@ -7,6 +7,16 @@ on:
 
 jobs:
   build:
+    strategy:
+      matrix:
+        include:
+          - platform: linux
+            arch: amd64
+          - platform: linux
+            arch: arm64
+          - platform: darwin
+            arch: arm64
+    
     runs-on: ubuntu-latest
 
     steps:
@@ -19,11 +29,15 @@ jobs:
           go-version: '1.24'
 
       - name: Build binary
+        env:
+          GOOS: ${{ matrix.platform }}
+          GOARCH: ${{ matrix.arch }}
         run: |
-          go build -o beachhead .
+          go build -o ${{ matrix.artifact }} .
 
       - name: Create GitHub Release
         id: create_release
+        if: matrix.platform == 'linux' && matrix.arch == 'amd64'
         uses: actions/create-release@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -39,6 +53,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./beachhead
-          asset_name: beachhead
+          asset_path: ./beachhead-${{ matrix.platform }}-${{ matrix.arch }}
+          asset_name: beachhead-${{ matrix.platform }}-${{ matrix.arch }}
           asset_content_type: application/octet-stream
