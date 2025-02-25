@@ -1,8 +1,6 @@
 package main
 
 import (
-	"bytes"
-	"context"
 	"fmt"
 	"io"
 	"log"
@@ -15,13 +13,32 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// Define RequestState enum
+type RequestState int
+
+const (
+	StateHeaderSent RequestState = iota
+	StateRequestSent
+	StateResponseHeaderReceived
+)
+
+// Add a struct to hold metadata about the current request, using an enum for state, and including the response channel
+type RequestMetadata struct {
+	Path                  string
+	Method                string
+	State                 RequestState
+	RequestContentLength  int64
+	ResponseContentLength int64
+	ResponseChan          chan []byte
+	ErrorChan             chan error
+}
+
+// Update Proxy struct to include fields for the active request and its response channel
 type Proxy struct {
-	upgrader websocket.Upgrader
-	ws       *websocket.Conn
-	mutex    sync.Mutex
-	// Add channels for message passing
-	messages chan []byte
-	done     chan struct{}
+	upgrader       websocket.Upgrader
+	mutex          sync.Mutex
+	ws             *websocket.Conn
+	currentRequest *RequestMetadata
 }
 
 func NewProxy() *Proxy {
@@ -31,8 +48,7 @@ func NewProxy() *Proxy {
 				return true
 			},
 		},
-		messages: make(chan []byte, 100), // Buffer size of 100 messages
-		done:     make(chan struct{}),
+		currentRequest: nil,
 	}
 }
 
@@ -43,7 +59,6 @@ func (p *Proxy) HandleConnection(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Failed to upgrade connection: %v", err)
 		return
 	}
-	defer ws.Close()
 
 	// Set the websocket connection
 	p.mutex.Lock()
@@ -56,63 +71,41 @@ func (p *Proxy) HandleConnection(w http.ResponseWriter, r *http.Request) {
 	p.ws = ws
 	p.mutex.Unlock()
 
-	// Create a context that we can cancel
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	go p.readPump(ws)
+}
 
-	// Start the read pump
-	go func() {
-		defer cancel() // Ensure context is canceled when we exit
-
-		for {
-			messageType, message, err := ws.ReadMessage()
-			if err != nil {
-				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
-					log.Printf("WebSocket read error: %v", err)
-				}
-				return
-			}
-
-			// Only handle binary messages
-			if messageType != websocket.BinaryMessage {
-				continue
-			}
-
-			// Try to send the message, respect context cancellation
-			select {
-			case p.messages <- message:
-				// Message sent successfully
-			case <-ctx.Done():
-				return
-			default:
-				// Channel is full, implement backpressure by waiting
-				select {
-				case p.messages <- message:
-					// Message sent successfully after waiting
-				case <-ctx.Done():
-					return
-				case <-time.After(5 * time.Second):
-					// Timeout after 5 seconds of backpressure
-					log.Printf("Message dropped due to backpressure")
-				}
-			}
-		}
-	}()
-
-	// Wait for done signal or context cancellation
-	<-ctx.Done()
-
-	// Clean up
-	p.mutex.Lock()
-	p.ws = nil
-	p.mutex.Unlock()
-
-	// Drain any remaining messages
+func (p *Proxy) readPump(ws *websocket.Conn) {
+	defer ws.Close()
 	for {
-		select {
-		case <-p.messages:
-		default:
-			return
+		_, message, err := ws.ReadMessage()
+		if err != nil {
+			p.mutex.Lock()
+			if p.currentRequest != nil && p.currentRequest.ErrorChan != nil && !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				select {
+				case p.currentRequest.ErrorChan <- err:
+				default:
+					log.Println("Error channel full, dropping error")
+				}
+			}
+			p.mutex.Unlock()
+			break
+		}
+
+		p.mutex.Lock()
+		var respChan chan []byte
+		if p.currentRequest != nil {
+			respChan = p.currentRequest.ResponseChan
+		}
+		p.mutex.Unlock()
+
+		if respChan != nil {
+			// Non-blocking send to avoid deadlocks if channel buffer is full
+			select {
+			case respChan <- message:
+			// message forwarded
+			default:
+				log.Println("Response channel full, dropping message")
+			}
 		}
 	}
 }
@@ -166,71 +159,148 @@ func sendRequest(r *http.Request, ws *websocket.Conn) error {
 	return nil
 }
 
-func (p *Proxy) HandleRequest(w http.ResponseWriter, r *http.Request) {
-	// Check if a websocket client is connected
+func (p *Proxy) startNewRequest(r *http.Request) *websocket.Conn {
 	p.mutex.Lock()
-	ws := p.ws
-	p.mutex.Unlock()
+	defer p.mutex.Unlock()
 
+	ws := p.ws
+	if ws == nil {
+		return nil
+	}
+
+	requestContentLength := int64(-1)
+	if clStr := r.Header.Get("Content-Length"); clStr != "" {
+		if cl, err := strconv.ParseInt(clStr, 10, 64); err == nil {
+			requestContentLength = cl
+		}
+	}
+	p.currentRequest = &RequestMetadata{
+		Path:                  r.URL.Path,
+		Method:                r.Method,
+		State:                 StateHeaderSent,
+		RequestContentLength:  requestContentLength,
+		ResponseContentLength: -1,
+		ResponseChan:          make(chan []byte, 100),
+		ErrorChan:             make(chan error, 1),
+	}
+	return ws
+}
+
+func (p *Proxy) cleanupCurrentRequest() {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	if p.currentRequest != nil {
+		// Close channels if they exist
+		if p.currentRequest.ResponseChan != nil {
+			close(p.currentRequest.ResponseChan)
+		}
+		if p.currentRequest.ErrorChan != nil {
+			close(p.currentRequest.ErrorChan)
+		}
+		p.currentRequest = nil
+	}
+}
+
+func (p *Proxy) HandleRequest(w http.ResponseWriter, r *http.Request) {
+	ws := p.startNewRequest(r)
+	defer p.cleanupCurrentRequest()
 	if ws == nil {
 		http.Error(w, "No WebSocket client connected", http.StatusServiceUnavailable)
 		return
 	}
 
+	// Send the request to the upstream client
 	if err := sendRequest(r, ws); err != nil {
 		http.Error(w, "Failed to proxy request: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	var headerBuf bytes.Buffer
-	bodyStarted := false
+	p.mutex.Lock()
+	// Optionally update state to StateRequestSent here if needed
+	p.currentRequest.State = StateRequestSent
+	p.mutex.Unlock()
 
-	// Read from the message channel instead of directly from websocket
-	messageTimeout := time.NewTimer(30 * time.Second)
-	defer messageTimeout.Stop()
+	// Accumulate header data, which may be fragmented across multiple messages
+	req := p.currentRequest
+	var headerBuf strings.Builder
 
-	for !bodyStarted {
-		select {
-		case message := <-p.messages:
-			headerBuf.Write(message)
-			if i := bytes.Index(headerBuf.Bytes(), []byte("\r\n\r\n")); i >= 0 {
-				headerData := headerBuf.Bytes()[:i]
-				remainingData := headerBuf.Bytes()[i+4:]
-
-				if err := returnResponseHeader(string(headerData), w); err != nil {
-					http.Error(w, "Invalid response headers: "+err.Error(), http.StatusInternalServerError)
-					return
-				}
-
-				if len(remainingData) > 0 {
-					w.Write(remainingData)
-					if f, ok := w.(http.Flusher); ok {
-						f.Flush()
-					}
-				}
-
-				bodyStarted = true
-			}
-		case <-messageTimeout.C:
-			http.Error(w, "Timeout waiting for response headers", http.StatusGatewayTimeout)
-			return
+	var firstMsg []byte
+	select {
+	case firstMsg = <-req.ResponseChan:
+	case <-time.After(30 * time.Second):
+		http.Error(w, "Gateway Timeout: upstream did not respond", http.StatusGatewayTimeout)
+		return
+	}
+	headerBuf.Write(firstMsg)
+	headerStr := headerBuf.String()
+	for !strings.Contains(headerStr, "\r\n\r\n") {
+		msg, ok := <-req.ResponseChan
+		if !ok {
+			break
 		}
+		headerBuf.Write(msg)
+		headerStr = headerBuf.String()
 	}
 
-	// Set a shorter timeout for body messages
-	messageTimeout.Reset(5 * time.Second)
+	idx := strings.Index(headerStr, "\r\n\r\n")
+	if idx < 0 {
+		http.Error(w, "Invalid response header received", http.StatusInternalServerError)
+		return
+	}
 
-	for {
-		select {
-		case message := <-p.messages:
-			w.Write(message)
+	headerPart := headerStr[:idx+4]
+	bodyRemainder := headerStr[idx+4:]
+
+	p.mutex.Lock()
+	req.State = StateResponseHeaderReceived
+	p.mutex.Unlock()
+
+	if err := returnResponseHeader(headerPart, w); err != nil {
+		http.Error(w, "Failed to process response header: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Check if we should expect a response body
+	contentLength := w.Header().Get("Content-Length")
+	connectionClose := strings.ToLower(w.Header().Get("Connection")) == "close"
+
+	// If Content-Length is 0 or not present and Connection isn't close, we're done
+	if contentLength == "0" {
+		return
+	}
+
+	if len(bodyRemainder) > 0 {
+		if _, err := w.Write([]byte(bodyRemainder)); err != nil {
+			log.Printf("Error writing initial response body: %v", err)
+		}
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		p.mutex.Lock()
+		req.ResponseContentLength += int64(len(bodyRemainder))
+		p.mutex.Unlock()
+	}
+
+	// Only continue reading the body if we have a non-zero Content-Length or Connection: close
+	if contentLength != "0" || connectionClose {
+		// Forward subsequent response messages without timeout
+		for {
+			msg, ok := <-req.ResponseChan
+			if !ok {
+				// Channel closed, end response
+				break
+			}
+			if _, err := w.Write(msg); err != nil {
+				log.Printf("Error writing response to client: %v", err)
+				break
+			}
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}
-			messageTimeout.Reset(5 * time.Second)
-		case <-messageTimeout.C:
-			// Consider this a normal EOF condition
-			return
+			p.mutex.Lock()
+			req.ResponseContentLength += int64(len(msg))
+			p.mutex.Unlock()
 		}
 	}
 }
