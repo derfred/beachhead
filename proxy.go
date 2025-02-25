@@ -22,23 +22,26 @@ const (
 	StateResponseHeaderReceived
 )
 
-// Add a struct to hold metadata about the current request, using an enum for state, and including the response channel
 type RequestMetadata struct {
 	Path                  string
 	Method                string
 	State                 RequestState
 	RequestContentLength  int64
 	ResponseContentLength int64
-	ResponseChan          chan []byte
-	ErrorChan             chan error
+	ResponseChan          chan websocketMessage
 }
 
-// Update Proxy struct to include fields for the active request and its response channel
 type Proxy struct {
 	upgrader       websocket.Upgrader
 	mutex          sync.Mutex
 	ws             *websocket.Conn
 	currentRequest *RequestMetadata
+}
+
+type websocketMessage struct {
+	Type    int
+	Message []byte
+	Error   error
 }
 
 func NewProxy() *Proxy {
@@ -77,12 +80,12 @@ func (p *Proxy) HandleConnection(w http.ResponseWriter, r *http.Request) {
 func (p *Proxy) readPump(ws *websocket.Conn) {
 	defer ws.Close()
 	for {
-		_, message, err := ws.ReadMessage()
+		messageType, message, err := ws.ReadMessage()
 		if err != nil {
 			p.mutex.Lock()
-			if p.currentRequest != nil && p.currentRequest.ErrorChan != nil && !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+			if p.currentRequest != nil && p.currentRequest.ResponseChan != nil && !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 				select {
-				case p.currentRequest.ErrorChan <- err:
+				case p.currentRequest.ResponseChan <- websocketMessage{Error: err}:
 				default:
 					log.Println("Error channel full, dropping error")
 				}
@@ -92,16 +95,22 @@ func (p *Proxy) readPump(ws *websocket.Conn) {
 		}
 
 		p.mutex.Lock()
-		var respChan chan []byte
+		var respChan chan websocketMessage
 		if p.currentRequest != nil {
 			respChan = p.currentRequest.ResponseChan
 		}
 		p.mutex.Unlock()
 
 		if respChan != nil {
+			// Create message struct and marshal it
+			wsMessage := websocketMessage{
+				Type:    messageType,
+				Message: message,
+			}
+
 			// Non-blocking send to avoid deadlocks if channel buffer is full
 			select {
-			case respChan <- message:
+			case respChan <- wsMessage:
 			// message forwarded
 			default:
 				log.Println("Response channel full, dropping message")
@@ -180,8 +189,7 @@ func (p *Proxy) startNewRequest(r *http.Request) *websocket.Conn {
 		State:                 StateHeaderSent,
 		RequestContentLength:  requestContentLength,
 		ResponseContentLength: -1,
-		ResponseChan:          make(chan []byte, 100),
-		ErrorChan:             make(chan error, 1),
+		ResponseChan:          make(chan websocketMessage, 100),
 	}
 	return ws
 }
@@ -194,9 +202,6 @@ func (p *Proxy) cleanupCurrentRequest() {
 		// Close channels if they exist
 		if p.currentRequest.ResponseChan != nil {
 			close(p.currentRequest.ResponseChan)
-		}
-		if p.currentRequest.ErrorChan != nil {
-			close(p.currentRequest.ErrorChan)
 		}
 		p.currentRequest = nil
 	}
@@ -225,21 +230,29 @@ func (p *Proxy) HandleRequest(w http.ResponseWriter, r *http.Request) {
 	req := p.currentRequest
 	var headerBuf strings.Builder
 
-	var firstMsg []byte
+	var firstMsg websocketMessage
 	select {
 	case firstMsg = <-req.ResponseChan:
 	case <-time.After(30 * time.Second):
 		http.Error(w, "Gateway Timeout: upstream did not respond", http.StatusGatewayTimeout)
 		return
 	}
-	headerBuf.Write(firstMsg)
+	if firstMsg.Error != nil {
+		http.Error(w, "Failed to process response header: "+firstMsg.Error.Error(), http.StatusInternalServerError)
+		return
+	}
+	headerBuf.Write(firstMsg.Message)
 	headerStr := headerBuf.String()
 	for !strings.Contains(headerStr, "\r\n\r\n") {
 		msg, ok := <-req.ResponseChan
 		if !ok {
 			break
 		}
-		headerBuf.Write(msg)
+		if msg.Error != nil {
+			http.Error(w, "Failed to process response header: "+msg.Error.Error(), http.StatusInternalServerError)
+			return
+		}
+		headerBuf.Write(msg.Message)
 		headerStr = headerBuf.String()
 	}
 
@@ -261,15 +274,6 @@ func (p *Proxy) HandleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if we should expect a response body
-	contentLength := w.Header().Get("Content-Length")
-	connectionClose := strings.ToLower(w.Header().Get("Connection")) == "close"
-
-	// If Content-Length is 0 or not present and Connection isn't close, we're done
-	if contentLength == "0" {
-		return
-	}
-
 	if len(bodyRemainder) > 0 {
 		if _, err := w.Write([]byte(bodyRemainder)); err != nil {
 			log.Printf("Error writing initial response body: %v", err)
@@ -282,25 +286,27 @@ func (p *Proxy) HandleRequest(w http.ResponseWriter, r *http.Request) {
 		p.mutex.Unlock()
 	}
 
-	// Only continue reading the body if we have a non-zero Content-Length or Connection: close
-	if contentLength != "0" || connectionClose {
-		// Forward subsequent response messages without timeout
-		for {
-			msg, ok := <-req.ResponseChan
-			if !ok {
-				// Channel closed, end response
-				break
-			}
-			if _, err := w.Write(msg); err != nil {
+	// Forward subsequent response messages without timeout
+	for {
+		msg, ok := <-req.ResponseChan
+		if !ok {
+			// Channel closed, end response
+			break
+		}
+		if msg.Error != nil {
+			http.Error(w, "Failed to process response body: "+msg.Error.Error(), http.StatusInternalServerError)
+			return
+		}
+		if msg.Type == websocket.BinaryMessage {
+			if _, err := w.Write(msg.Message); err != nil {
 				log.Printf("Error writing response to client: %v", err)
 				break
 			}
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}
-			p.mutex.Lock()
-			req.ResponseContentLength += int64(len(msg))
-			p.mutex.Unlock()
+		} else if string(msg.Message) == "ResponseComplete" {
+			break
 		}
 	}
 }

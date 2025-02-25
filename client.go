@@ -132,6 +132,11 @@ func (client *WebSocketClient) handleRequest(headerBuffer *bytes.Buffer, bodyBuf
 		log.Printf("Error writing response to WebSocket: %v", err)
 		return
 	}
+
+	if err := client.conn.WriteMessage(websocket.TextMessage, []byte("ResponseComplete")); err != nil {
+		log.Printf("Error writing response complete to WebSocket: %v", err)
+		return
+	}
 }
 
 // Shutdown gracefully closes the WebSocket connection.
