@@ -157,7 +157,11 @@ func TestIntegrationWithCertificates(t *testing.T) {
 		t.Fatalf("Failed to create client: %v", err)
 	}
 	go client.AcceptMessages()
-	defer client.Shutdown()
+	defer func() {
+		if err := client.Shutdown(); err != nil {
+			t.Logf("Error during client shutdown: %v", err)
+		}
+	}()
 	time.Sleep(1 * time.Second)
 
 	// Test request

@@ -106,13 +106,17 @@ func (e *CommandExecutor) Execute(cwd string, cmd string, args map[string]interf
 // HealthHandler responds with 200 OK.
 func HealthHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("OK"))
+	if _, err := w.Write([]byte("OK")); err != nil {
+		log.Printf("Error writing health response: %v", err)
+	}
 }
 
 // VersionHandler returns the current version.
 func VersionHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(version))
+	if _, err := w.Write([]byte(version)); err != nil {
+		log.Printf("Error writing version response: %v", err)
+	}
 }
 
 func isMultipartFormRequest(contentType string) bool {
@@ -301,7 +305,10 @@ func MakeWorkspaceHandler(server *Server) http.HandlerFunc {
 			}
 
 			if f.FileInfo().IsDir() {
-				os.MkdirAll(fpath, os.ModePerm)
+				if err := os.MkdirAll(fpath, os.ModePerm); err != nil {
+					http.Error(w, "Failed to create directory: "+err.Error(), http.StatusInternalServerError)
+					return
+				}
 				continue
 			}
 
@@ -338,7 +345,9 @@ func MakeWorkspaceHandler(server *Server) http.HandlerFunc {
 
 		// For future operations, the new workspace base is now tmpDir.
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Workspace set to: " + tmpDir))
+		if _, err := w.Write([]byte("Workspace set to: " + tmpDir)); err != nil {
+			log.Printf("Error writing workspace response: %v", err)
+		}
 	}
 }
 
