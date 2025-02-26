@@ -395,7 +395,9 @@ func MakeWorkspaceUploadHandler(server *Server) http.HandlerFunc {
 		}
 
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("File uploaded successfully"))
+		if _, err := w.Write([]byte("File uploaded successfully")); err != nil {
+			log.Printf("Error writing upload success response: %v", err)
+		}
 	}
 }
 

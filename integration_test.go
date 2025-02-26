@@ -133,7 +133,9 @@ func TestIntegrationWithCertificates(t *testing.T) {
 	// Start upstream server
 	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Hello from secure upstream"))
+		if _, err := w.Write([]byte("Hello from secure upstream")); err != nil {
+			t.Errorf("Failed to write response: %v", err)
+		}
 	}))
 	defer upstreamServer.Close()
 
