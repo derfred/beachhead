@@ -39,7 +39,7 @@ jobs:
           go build -o beachhead-${{ matrix.platform }}-${{ matrix.arch }} .
 
       - name: Upload binary as artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.goos }}_${{ matrix.goarch }}
           path: ${{ format('beachhead-{0}-{1}', matrix.platform, matrix.arch) }}
