@@ -79,7 +79,20 @@ func (p *Proxy) HandleConnection(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Proxy) readPump(ws *websocket.Conn) {
-	defer ws.Close()
+	defer func() {
+		ws.Close()
+		// Clear the websocket connection when it's terminated
+		p.mutex.Lock()
+		if p.ws == ws { // Only clear if it's still the same connection
+			p.ws = nil
+		}
+		if p.currentRequest != nil && p.currentRequest.ResponseChan != nil {
+			close(p.currentRequest.ResponseChan)
+			p.currentRequest = nil
+		}
+		p.mutex.Unlock()
+	}()
+
 	for {
 		messageType, message, err := ws.ReadMessage()
 		if err != nil {
