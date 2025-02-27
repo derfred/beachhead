@@ -22,26 +22,72 @@ const (
 	StateResponseHeaderReceived
 )
 
-type RequestMetadata struct {
+// ProxyWriter is an interface for types that can write websocket messages
+type ProxyWriter interface {
+	WriteMessage(messageType int, data []byte) error
+}
+
+type Request struct {
+	RequestID             byte
 	Path                  string
 	Method                string
 	State                 RequestState
 	RequestContentLength  int64
 	ResponseContentLength int64
 	ResponseChan          chan websocketMessage
+	proxy                 ProxyWriter
+}
+
+func (r *Request) WriteMessage(messageType int, data []byte) error {
+	if messageType == websocket.TextMessage {
+		text := fmt.Sprintf("%s %d", string(data), r.RequestID)
+		data = []byte(text)
+	} else if messageType == websocket.BinaryMessage {
+		data = append([]byte{r.RequestID}, data...)
+	}
+	return r.proxy.WriteMessage(messageType, data)
 }
 
 type Proxy struct {
 	upgrader       websocket.Upgrader
-	mutex          sync.Mutex
+	requestsMutex  sync.Mutex
+	writeMutex     sync.Mutex
 	ws             *websocket.Conn
-	currentRequest *RequestMetadata
+	activeRequests map[byte]*Request
 }
 
 type websocketMessage struct {
-	Type    int
-	Message []byte
-	Error   error
+	RequestID byte
+	Type      int
+	Message   []byte
+	Error     error
+}
+
+func parseMessage(messageType int, message []byte) (*websocketMessage, error) {
+	result := &websocketMessage{
+		Type: messageType,
+	}
+	if messageType == websocket.TextMessage {
+		str := string(message)
+		idx := strings.LastIndex(str, " ")
+		if idx < 0 || idx == len(str)-1 {
+			return nil, fmt.Errorf("invalid request ID: %s", str)
+		}
+		idStr := strings.TrimSpace(str[idx+1:])
+		id, err := strconv.ParseUint(idStr, 10, 8)
+		if err != nil {
+			return nil, fmt.Errorf("invalid request ID: %s", idStr)
+		}
+		result.RequestID = byte(id)
+		result.Message = []byte(strings.TrimSpace(str[:idx]))
+	} else if messageType == websocket.BinaryMessage {
+		if len(message) < 1 {
+			return nil, fmt.Errorf("invalid binary message format: %s", message)
+		}
+		result.RequestID = message[0]
+		result.Message = message[1:]
+	}
+	return result, nil
 }
 
 func NewProxy() *Proxy {
@@ -51,15 +97,21 @@ func NewProxy() *Proxy {
 				return true
 			},
 		},
-		currentRequest: nil,
+		activeRequests: make(map[byte]*Request),
 	}
 }
 
+func (p *Proxy) WriteMessage(messageType int, data []byte) error {
+	p.writeMutex.Lock()
+	defer p.writeMutex.Unlock()
+	return p.ws.WriteMessage(messageType, data)
+}
+
 func (p *Proxy) HandleConnection(w http.ResponseWriter, r *http.Request) {
-	p.mutex.Lock()
+	p.requestsMutex.Lock()
 	// Check if a websocket client is already connected
 	if p.ws != nil {
-		p.mutex.Unlock()
+		p.requestsMutex.Unlock()
 		http.Error(w, "Websocket client already connected", http.StatusConflict)
 		return
 	}
@@ -73,7 +125,7 @@ func (p *Proxy) HandleConnection(w http.ResponseWriter, r *http.Request) {
 
 	// Set the websocket connection
 	p.ws = ws
-	p.mutex.Unlock()
+	p.requestsMutex.Unlock()
 
 	go p.readPump(ws)
 }
@@ -82,50 +134,53 @@ func (p *Proxy) readPump(ws *websocket.Conn) {
 	defer func() {
 		ws.Close()
 		// Clear the websocket connection when it's terminated
-		p.mutex.Lock()
+		p.requestsMutex.Lock()
 		if p.ws == ws { // Only clear if it's still the same connection
 			p.ws = nil
 		}
-		if p.currentRequest != nil && p.currentRequest.ResponseChan != nil {
-			close(p.currentRequest.ResponseChan)
-			p.currentRequest = nil
+		for _, req := range p.activeRequests {
+			if req.ResponseChan != nil {
+				close(req.ResponseChan)
+				req.ResponseChan = nil
+			}
 		}
-		p.mutex.Unlock()
+		p.requestsMutex.Unlock()
 	}()
 
 	for {
 		messageType, message, err := ws.ReadMessage()
 		if err != nil {
-			p.mutex.Lock()
-			if p.currentRequest != nil && p.currentRequest.ResponseChan != nil && !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-				select {
-				case p.currentRequest.ResponseChan <- websocketMessage{Error: err}:
-				default:
-					log.Println("Error channel full, dropping error")
+			if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				p.requestsMutex.Lock()
+				for _, req := range p.activeRequests {
+					if req.ResponseChan != nil {
+						select {
+						case req.ResponseChan <- websocketMessage{Error: err}:
+						default:
+							log.Println("Error channel full, dropping error")
+						}
+					}
 				}
+				p.requestsMutex.Unlock()
 			}
-			p.mutex.Unlock()
 			break
 		}
 
-		p.mutex.Lock()
-		var respChan chan websocketMessage
-		if p.currentRequest != nil {
-			respChan = p.currentRequest.ResponseChan
+		wsMessage, err := parseMessage(messageType, message)
+		if err != nil {
+			log.Printf("Error parsing message: %v", err)
+			continue
 		}
-		p.mutex.Unlock()
 
-		if respChan != nil {
-			// Create message struct and marshal it
-			wsMessage := websocketMessage{
-				Type:    messageType,
-				Message: message,
-			}
+		req, exists := p.activeRequests[wsMessage.RequestID]
+		if !exists {
+			log.Printf("Received message for unknown request ID: %d", wsMessage.RequestID)
+			continue
+		}
 
-			// Non-blocking send to avoid deadlocks if channel buffer is full
+		if req.ResponseChan != nil {
 			select {
-			case respChan <- wsMessage:
-			// message forwarded
+			case req.ResponseChan <- *wsMessage:
 			default:
 				log.Println("Response channel full, dropping message")
 			}
@@ -133,7 +188,7 @@ func (p *Proxy) readPump(ws *websocket.Conn) {
 	}
 }
 
-func sendRequest(r *http.Request, ws *websocket.Conn) error {
+func (req *Request) sendRequest(r *http.Request) error {
 	// Proxy the request to the websocket client
 	var reqBuilder strings.Builder
 	reqBuilder.WriteString(fmt.Sprintf("%s %s %s\n", r.Method, r.URL.String(), r.Proto))
@@ -145,14 +200,14 @@ func sendRequest(r *http.Request, ws *websocket.Conn) error {
 	reqBuilder.WriteString("\n")
 
 	// Write headers first
-	if err := ws.WriteMessage(websocket.BinaryMessage, []byte(reqBuilder.String())); err != nil {
+	if err := req.WriteMessage(websocket.BinaryMessage, []byte(reqBuilder.String())); err != nil {
 		return fmt.Errorf("failed to write to WebSocket: %w", err)
 	}
 
 	// Stream the body in chunks if present
 	if r.Body != nil {
 		// Tell the client that the headers are complete
-		if err := ws.WriteMessage(websocket.TextMessage, []byte("HeaderComplete")); err != nil {
+		if err := req.WriteMessage(websocket.TextMessage, []byte("RequestHeadersComplete")); err != nil {
 			return fmt.Errorf("failed to write to WebSocket: %w", err)
 		}
 
@@ -164,7 +219,7 @@ func sendRequest(r *http.Request, ws *websocket.Conn) error {
 			}
 			if n > 0 {
 				// Send the chunk as a binary message
-				if err := ws.WriteMessage(websocket.BinaryMessage, buffer[:n]); err != nil {
+				if err := req.WriteMessage(websocket.BinaryMessage, buffer[:n]); err != nil {
 					return fmt.Errorf("failed to write to WebSocket: %w", err)
 				}
 			}
@@ -175,20 +230,37 @@ func sendRequest(r *http.Request, ws *websocket.Conn) error {
 	}
 
 	// Tell the client that the request is complete
-	if err := ws.WriteMessage(websocket.TextMessage, []byte("RequestComplete")); err != nil {
+	if err := req.WriteMessage(websocket.TextMessage, []byte("RequestComplete")); err != nil {
 		return fmt.Errorf("failed to write to WebSocket: %w", err)
 	}
+
+	req.State = StateRequestSent
 
 	return nil
 }
 
-func (p *Proxy) startNewRequest(r *http.Request) *websocket.Conn {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
+func (p *Proxy) startNewRequest(r *http.Request) (*Request, error) {
+	p.requestsMutex.Lock()
+	defer p.requestsMutex.Unlock()
 
 	ws := p.ws
 	if ws == nil {
-		return nil
+		return nil, fmt.Errorf("no websocket connection available")
+	}
+
+	// Find first available request ID
+	var requestID byte
+	found := false
+	for i := byte(0); i < 255; i++ {
+		if _, exists := p.activeRequests[i]; !exists {
+			requestID = i
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return nil, fmt.Errorf("maximum number of concurrent requests reached (255)")
 	}
 
 	requestContentLength := int64(-1)
@@ -197,51 +269,58 @@ func (p *Proxy) startNewRequest(r *http.Request) *websocket.Conn {
 			requestContentLength = cl
 		}
 	}
-	p.currentRequest = &RequestMetadata{
+
+	req := &Request{
+		RequestID:             requestID,
 		Path:                  r.URL.Path,
 		Method:                r.Method,
 		State:                 StateHeaderSent,
 		RequestContentLength:  requestContentLength,
 		ResponseContentLength: -1,
 		ResponseChan:          make(chan websocketMessage, 100),
+		proxy:                 p,
 	}
-	return ws
+
+	p.activeRequests[requestID] = req
+	req.WriteMessage(websocket.TextMessage, []byte("NewRequest"))
+
+	return req, nil
 }
 
-func (p *Proxy) cleanupCurrentRequest() {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
+func (p *Proxy) cleanupRequest(req *Request) {
+	p.requestsMutex.Lock()
+	defer p.requestsMutex.Unlock()
 
-	if p.currentRequest != nil {
-		// Close channels if they exist
-		if p.currentRequest.ResponseChan != nil {
-			close(p.currentRequest.ResponseChan)
+	if req, exists := p.activeRequests[req.RequestID]; exists {
+		if req.ResponseChan != nil {
+			close(req.ResponseChan)
+			req.ResponseChan = nil
 		}
-		p.currentRequest = nil
+		delete(p.activeRequests, req.RequestID)
 	}
 }
 
 func (p *Proxy) HandleRequest(w http.ResponseWriter, r *http.Request) {
-	ws := p.startNewRequest(r)
-	defer p.cleanupCurrentRequest()
-	if ws == nil {
-		http.Error(w, "No WebSocket client connected", http.StatusServiceUnavailable)
-		return
+	req, err := p.startNewRequest(r)
+	if err != nil {
+		if err.Error() == "maximum number of concurrent requests reached (255)" {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		} else if err.Error() == "no websocket connection available" {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		} else {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
 	}
+	defer p.cleanupRequest(req)
 
 	// Send the request to the upstream client
-	if err := sendRequest(r, ws); err != nil {
+	err = req.sendRequest(r)
+	if err != nil {
 		http.Error(w, "Failed to proxy request: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	p.mutex.Lock()
-	// Optionally update state to StateRequestSent here if needed
-	p.currentRequest.State = StateRequestSent
-	p.mutex.Unlock()
-
 	// Accumulate header data, which may be fragmented across multiple messages
-	req := p.currentRequest
 	var headerBuf strings.Builder
 
 	var firstMsg websocketMessage
@@ -256,6 +335,7 @@ func (p *Proxy) HandleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	headerBuf.Write(firstMsg.Message)
+
 	headerStr := headerBuf.String()
 	for !strings.Contains(headerStr, "\r\n\r\n") {
 		msg, ok := <-req.ResponseChan
@@ -279,9 +359,7 @@ func (p *Proxy) HandleRequest(w http.ResponseWriter, r *http.Request) {
 	headerPart := headerStr[:idx+4]
 	bodyRemainder := headerStr[idx+4:]
 
-	p.mutex.Lock()
 	req.State = StateResponseHeaderReceived
-	p.mutex.Unlock()
 
 	if err := returnResponseHeader(headerPart, w); err != nil {
 		http.Error(w, "Failed to process response header: "+err.Error(), http.StatusInternalServerError)
@@ -290,14 +368,13 @@ func (p *Proxy) HandleRequest(w http.ResponseWriter, r *http.Request) {
 
 	if len(bodyRemainder) > 0 {
 		if _, err := w.Write([]byte(bodyRemainder)); err != nil {
-			log.Printf("Error writing initial response body: %v", err)
+			http.Error(w, "Error writing initial response body: "+err.Error(), http.StatusInternalServerError)
+			return
 		}
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
-		p.mutex.Lock()
 		req.ResponseContentLength += int64(len(bodyRemainder))
-		p.mutex.Unlock()
 	}
 
 	// Forward subsequent response messages without timeout
