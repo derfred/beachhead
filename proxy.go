@@ -282,7 +282,10 @@ func (p *Proxy) startNewRequest(r *http.Request) (*Request, error) {
 	}
 
 	p.activeRequests[requestID] = req
-	req.WriteMessage(websocket.TextMessage, []byte("NewRequest"))
+	err := req.WriteMessage(websocket.TextMessage, []byte("NewRequest"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to write to WebSocket: %w", err)
+	}
 
 	return req, nil
 }
