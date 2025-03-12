@@ -194,7 +194,10 @@ func (p *Proxy) readPump(ws *websocket.Conn) {
 
 		if req.ResponseChan != nil {
 			if len(req.ResponseChan) >= cap(req.ResponseChan)/2 {
-				req.WriteMessage(websocket.TextMessage, []byte("SlowDown"))
+				err := req.WriteMessage(websocket.TextMessage, []byte("SlowDown"))
+				if err != nil {
+					log.Printf("Failed to send SlowDown message: %v", err)
+				}
 			}
 
 			select {
