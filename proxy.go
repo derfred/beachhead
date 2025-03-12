@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"golang.org/x/time/rate"
 )
 
 // Define RequestState enum
@@ -49,11 +50,13 @@ func (r *Request) WriteMessage(messageType int, data []byte) error {
 }
 
 type Proxy struct {
-	upgrader       websocket.Upgrader
-	requestsMutex  sync.Mutex
-	writeMutex     sync.Mutex
-	ws             *websocket.Conn
-	activeRequests map[byte]*Request
+	upgrader             websocket.Upgrader
+	requestsMutex        sync.Mutex
+	writeMutex           sync.Mutex
+	ws                   *websocket.Conn
+	activeRequests       map[byte]*Request
+	requestIDQueue       []byte
+	unknownReqLogLimiter *rate.Limiter
 }
 
 type websocketMessage struct {
@@ -91,13 +94,21 @@ func parseMessage(messageType int, message []byte) (*websocketMessage, error) {
 }
 
 func NewProxy() *Proxy {
+	// Initialize the queue with all available request IDs (0-254)
+	idQueue := make([]byte, 255)
+	for i := range 255 {
+		idQueue[i] = byte(i)
+	}
+
 	return &Proxy{
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				return true
 			},
 		},
-		activeRequests: make(map[byte]*Request),
+		activeRequests:       make(map[byte]*Request),
+		requestIDQueue:       idQueue,
+		unknownReqLogLimiter: rate.NewLimiter(rate.Every(5*time.Second), 1), // Allow 1 log per 5 seconds
 	}
 }
 
@@ -157,7 +168,8 @@ func (p *Proxy) readPump(ws *websocket.Conn) {
 						select {
 						case req.ResponseChan <- websocketMessage{Error: err}:
 						default:
-							log.Println("Error channel full, dropping error")
+							log.Printf("Response channel full, dropping error")
+							p.cleanupRequest(req)
 						}
 					}
 				}
@@ -174,15 +186,22 @@ func (p *Proxy) readPump(ws *websocket.Conn) {
 
 		req, exists := p.activeRequests[wsMessage.RequestID]
 		if !exists {
-			log.Printf("Received message for unknown request ID: %d", wsMessage.RequestID)
+			if p.unknownReqLogLimiter.Allow() {
+				log.Printf("Received message for unknown request ID: %d", wsMessage.RequestID)
+			}
 			continue
 		}
 
 		if req.ResponseChan != nil {
+			if len(req.ResponseChan) >= cap(req.ResponseChan)/2 {
+				req.WriteMessage(websocket.TextMessage, []byte("SlowDown"))
+			}
+
 			select {
 			case req.ResponseChan <- *wsMessage:
 			default:
-				log.Println("Response channel full, dropping message")
+				log.Println("Response channel full, dropping request")
+				p.cleanupRequest(req)
 			}
 		}
 	}
@@ -248,20 +267,14 @@ func (p *Proxy) startNewRequest(r *http.Request) (*Request, error) {
 		return nil, fmt.Errorf("no websocket connection available")
 	}
 
-	// Find first available request ID
-	var requestID byte
-	found := false
-	for i := byte(0); i < 255; i++ {
-		if _, exists := p.activeRequests[i]; !exists {
-			requestID = i
-			found = true
-			break
-		}
-	}
-
-	if !found {
+	// Get a request ID from the queue
+	if len(p.requestIDQueue) == 0 {
 		return nil, fmt.Errorf("maximum number of concurrent requests reached (255)")
 	}
+
+	// Dequeue a request ID from the front of the queue
+	requestID := p.requestIDQueue[0]
+	p.requestIDQueue = p.requestIDQueue[1:]
 
 	requestContentLength := int64(-1)
 	if clStr := r.Header.Get("Content-Length"); clStr != "" {
@@ -270,14 +283,15 @@ func (p *Proxy) startNewRequest(r *http.Request) (*Request, error) {
 		}
 	}
 
+	log.Printf("Starting new request with ID: %d %s %s", requestID, r.Method, r.URL.Path)
 	req := &Request{
 		RequestID:             requestID,
 		Path:                  r.URL.Path,
 		Method:                r.Method,
 		State:                 StateHeaderSent,
 		RequestContentLength:  requestContentLength,
-		ResponseContentLength: -1,
-		ResponseChan:          make(chan websocketMessage, 100),
+		ResponseContentLength: 0,
+		ResponseChan:          make(chan websocketMessage, 500),
 		proxy:                 p,
 	}
 
@@ -300,6 +314,9 @@ func (p *Proxy) cleanupRequest(req *Request) {
 			req.ResponseChan = nil
 		}
 		delete(p.activeRequests, req.RequestID)
+
+		// Add the freed ID back to the end of the queue
+		p.requestIDQueue = append(p.requestIDQueue, req.RequestID)
 	}
 }
 
@@ -399,6 +416,7 @@ func (p *Proxy) HandleRequest(w http.ResponseWriter, r *http.Request) {
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}
+			req.ResponseContentLength += int64(len(msg.Message))
 		} else if string(msg.Message) == "ResponseComplete" {
 			break
 		}
