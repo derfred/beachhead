@@ -286,7 +286,6 @@ func (p *Proxy) startNewRequest(r *http.Request) (*Request, error) {
 		}
 	}
 
-	log.Printf("Starting new request with ID: %d %s %s", requestID, r.Method, r.URL.Path)
 	req := &Request{
 		RequestID:             requestID,
 		Path:                  r.URL.Path,
