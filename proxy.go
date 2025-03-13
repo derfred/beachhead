@@ -169,6 +169,10 @@ func (p *Proxy) readPump(ws *websocket.Conn) {
 						case req.ResponseChan <- websocketMessage{Error: err}:
 						default:
 							log.Printf("Response channel full, dropping error")
+							err := req.WriteMessage(websocket.TextMessage, []byte("Cancel"))
+							if err != nil {
+								log.Printf("Failed to send Cancel message: %v", err)
+							}
 							p.cleanupRequest(req)
 						}
 					}
@@ -204,6 +208,10 @@ func (p *Proxy) readPump(ws *websocket.Conn) {
 			case req.ResponseChan <- *wsMessage:
 			default:
 				log.Println("Response channel full, dropping request")
+				err := req.WriteMessage(websocket.TextMessage, []byte("Cancel"))
+				if err != nil {
+					log.Printf("Failed to send Cancel message: %v", err)
+				}
 				p.cleanupRequest(req)
 			}
 		}
