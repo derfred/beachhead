@@ -168,3 +168,65 @@ func TestSendRequest(t *testing.T) {
 		}
 	}
 }
+
+// TestHandleRequestFailedStart tests that the handler exits early when startNewRequest fails
+func TestHandleRequestFailedStart(t *testing.T) {
+	// Create a proxy with no websocket connection
+	proxy := NewProxy()
+
+	// Create a test HTTP request
+	req, err := http.NewRequest("GET", "http://example.com/test", nil)
+	if err != nil {
+		t.Fatalf("Failed to create HTTP request: %v", err)
+	}
+
+	// Create a response recorder to capture the response
+	recorder := httptest.NewRecorder()
+
+	// Call HandleRequest - this should not panic even though there's no websocket connection
+	proxy.HandleRequest(recorder, req)
+
+	// Verify that we got the expected error response
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Errorf("Expected status code %d, got %d", http.StatusServiceUnavailable, recorder.Code)
+	}
+
+	// Verify the error message
+	expectedError := "no websocket connection available"
+	if !strings.Contains(recorder.Body.String(), expectedError) {
+		t.Errorf("Expected error message to contain '%s', got '%s'", expectedError, recorder.Body.String())
+	}
+}
+
+// TestHandleRequestMaxConcurrentRequests tests that the handler exits early when maximum concurrent requests is reached
+func TestHandleRequestMaxConcurrentRequests(t *testing.T) {
+	// Create a proxy with an empty request ID queue to simulate maximum concurrent requests
+	proxy := NewProxy()
+	proxy.requestIDQueue = []byte{} // Empty the queue
+
+	// Create a mock websocket connection
+	proxy.ws = &websocket.Conn{}
+
+	// Create a test HTTP request
+	req, err := http.NewRequest("GET", "http://example.com/test", nil)
+	if err != nil {
+		t.Fatalf("Failed to create HTTP request: %v", err)
+	}
+
+	// Create a response recorder to capture the response
+	recorder := httptest.NewRecorder()
+
+	// Call HandleRequest - this should not panic even though there are no request IDs available
+	proxy.HandleRequest(recorder, req)
+
+	// Verify that we got the expected error response
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Errorf("Expected status code %d, got %d", http.StatusServiceUnavailable, recorder.Code)
+	}
+
+	// Verify the error message
+	expectedError := "maximum number of concurrent requests reached (255)"
+	if !strings.Contains(recorder.Body.String(), expectedError) {
+		t.Errorf("Expected error message to contain '%s', got '%s'", expectedError, recorder.Body.String())
+	}
+}

@@ -318,7 +318,7 @@ func (p *Proxy) cleanupRequest(req *Request) {
 	p.requestsMutex.Lock()
 	defer p.requestsMutex.Unlock()
 
-	if req, exists := p.activeRequests[req.RequestID]; exists {
+	if _, exists := p.activeRequests[req.RequestID]; exists {
 		if req.ResponseChan != nil {
 			close(req.ResponseChan)
 			req.ResponseChan = nil
@@ -340,6 +340,7 @@ func (p *Proxy) HandleRequest(w http.ResponseWriter, r *http.Request) {
 		} else {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
+		return
 	}
 	defer p.cleanupRequest(req)
 
