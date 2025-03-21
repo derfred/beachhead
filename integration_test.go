@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -569,24 +570,31 @@ func TestProcessTerminationIntegration(t *testing.T) {
 	// Create a channel to capture any errors from the background goroutine
 	errCh := make(chan string, 1)
 
+	// Use a mutex to protect access to shared variables
+	var errMutex sync.Mutex
+
 	// Execute the sleep command in the background
-	go func(errCh chan<- string) {
+	go func() {
 		_, err := client.Do(req)
 		if err != nil && !strings.Contains(err.Error(), "EOF") && !strings.Contains(err.Error(), "connection closed") {
+			errMutex.Lock()
 			errCh <- fmt.Sprintf("Sleep command execution error (may be expected if terminated): %v", err)
+			errMutex.Unlock()
 		}
-	}(errCh)
+	}()
 
 	// Wait a bit for the process to start
 	time.Sleep(2 * time.Second)
 
 	// Check for any errors from the goroutine (non-blocking)
+	errMutex.Lock()
 	select {
 	case errMsg := <-errCh:
 		t.Logf("%s", errMsg)
 	default:
 		// No error, continue
 	}
+	errMutex.Unlock()
 
 	// Get list of processes
 	processesURL := fmt.Sprintf("https://localhost:%d/workspace/processes", server.GetExternalPort())

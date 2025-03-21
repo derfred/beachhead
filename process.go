@@ -13,6 +13,35 @@ import (
 	"time"
 )
 
+// ThreadSafeWriter wraps an io.Writer with a mutex to make it thread-safe
+type ThreadSafeWriter struct {
+	writer io.Writer
+	mutex  sync.Mutex
+}
+
+// NewThreadSafeWriter creates a new thread-safe writer
+func NewThreadSafeWriter(w io.Writer) *ThreadSafeWriter {
+	return &ThreadSafeWriter{
+		writer: w,
+	}
+}
+
+// Write implements the io.Writer interface in a thread-safe manner
+func (w *ThreadSafeWriter) Write(p []byte) (n int, err error) {
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+	return w.writer.Write(p)
+}
+
+// Flush implements the http.Flusher interface if the underlying writer supports it
+func (w *ThreadSafeWriter) Flush() {
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+	if f, ok := w.writer.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // ProcessInfo represents information about a running process
 type ProcessInfo struct {
 	ID        string    // Unique identifier for the process
@@ -32,11 +61,14 @@ func (p *ProcessInfo) WriteToAllProcessWriters(data []byte) {
 	defer p.Lock.Unlock()
 
 	for _, writer := range p.Writers {
-		writer.Write(data)
+		if _, err := writer.Write(data); err != nil {
+			log.Printf("Error writing to output: %v", err)
+			continue
+		}
 
-		// Flush if the writer supports it
-		if f, ok := writer.(http.Flusher); ok {
-			f.Flush()
+		// Try to flush if it's a ThreadSafeWriter
+		if tsw, ok := writer.(*ThreadSafeWriter); ok {
+			tsw.Flush()
 		}
 	}
 }
@@ -80,6 +112,7 @@ func (r *ProcessRegistry) AddWriterToProcess(processID string, writer io.Writer)
 	process.Lock.Lock()
 	defer process.Lock.Unlock()
 
+	// Add the writer directly without wrapping (the caller is responsible for thread safety)
 	process.Writers = append(process.Writers, writer)
 	return nil
 }

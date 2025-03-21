@@ -476,19 +476,17 @@ func (workspace *WorkspaceHandler) ProcessOutputHandler(w http.ResponseWriter, p
 	w.Header().Set("Content-Type", "text/plain")
 	w.Header().Set("Trailer", "X-Exit-Code")
 
-	// Create a buffered writer to improve performance
-	writer := w
+	// Create a thread-safe writer
+	safeWriter := NewThreadSafeWriter(w)
 
 	// Add the writer to the process's list of writers
-	if err := workspace.processRegistry.AddWriterToProcess(process.ID, writer); err != nil {
+	if err := workspace.processRegistry.AddWriterToProcess(process.ID, safeWriter); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to attach to process output: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// Make sure to flush the initial headers
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
+	// Make sure to flush the initial headers using our safe writer
+	safeWriter.Flush()
 
 	// Wait for the process to complete
 	exitCode := process.Wait()
