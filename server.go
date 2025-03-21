@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
 )
 
 type Server struct {
@@ -15,8 +16,7 @@ type Server struct {
 	externalTlsListener net.Listener
 	externalServer      *http.Server
 	proxy               *Proxy
-	workspaceBase       string
-	workspaceCurrent    string
+	workspace           *WorkspaceHandler
 }
 
 func authenticate(authToken string, next http.Handler) http.Handler {
@@ -41,8 +41,8 @@ func authenticate(authToken string, next http.Handler) http.Handler {
 
 func NewServer(cfg config) *Server {
 	result := Server{
-		proxy:         NewProxy(),
-		workspaceBase: cfg.Workspace,
+		proxy:     NewProxy(),
+		workspace: NewWorkspaceHandler(cfg.Workspace, cfg.ShellTemplates),
 	}
 
 	// Generate self-signed cert if not provided via env vars.
@@ -73,11 +73,40 @@ func NewServer(cfg config) *Server {
 	extMux := http.NewServeMux()
 	extMux.HandleFunc("/health", HealthHandler)
 	extMux.HandleFunc("/version", VersionHandler)
-	extMux.Handle("/exec/", authenticate(cfg.authToken, MakeExecHandler(cfg.ShellTemplates, &result)))
-	extMux.Handle("/workspace", authenticate(cfg.authToken, MakeWorkspaceHandler(&result)))
-	extMux.Handle("/workspace/upload/", authenticate(cfg.authToken, http.HandlerFunc(MakeWorkspaceUploadHandler(&result))))
-	extMux.Handle("/workspace/download/", authenticate(cfg.authToken, http.HandlerFunc(MakeWorkspaceDownloadHandler(&result))))
+	extMux.Handle("/workspace", authenticate(cfg.authToken, result.workspace.CreateWorkspaceHandler()))
+	extMux.Handle("/workspace/upload/", authenticate(cfg.authToken, result.workspace.MakeWorkspaceUploadHandler()))
+	extMux.Handle("/workspace/download/", authenticate(cfg.authToken, result.workspace.MakeWorkspaceDownloadHandler()))
 	extMux.Handle("/ws", authenticate(cfg.authToken, http.HandlerFunc(result.proxy.HandleConnection)))
+
+	// Process management endpoints
+	extMux.Handle("/workspace/exec/", authenticate(cfg.authToken, result.workspace.MakeExecHandler()))
+	extMux.Handle("/workspace/processes", authenticate(cfg.authToken, result.workspace.MakeProcessListHandler()))
+	extMux.Handle("/workspace/process/", authenticate(cfg.authToken, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		processID := strings.TrimPrefix(r.URL.Path, "/workspace/process/")
+		if processID == "" {
+			http.Error(w, "Process ID is required", http.StatusBadRequest)
+			return
+		}
+
+		// Call the ProcessRegistry to get the process
+		process, exists := result.workspace.processRegistry.GetProcess(processID)
+		if !exists {
+			http.Error(w, fmt.Sprintf("Process with ID %s not found", processID), http.StatusNotFound)
+			return
+		}
+
+		// Route based on HTTP method
+		switch r.Method {
+		case http.MethodGet:
+			// GET requests are handled by the details handler
+			result.workspace.ProcessDetailsHandler(w, process)
+		case http.MethodDelete:
+			// DELETE requests are handled by the terminate handler
+			result.workspace.ProcessTerminateHandler(w, process)
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})))
 
 	result.externalServer = &http.Server{
 		Handler: extMux,

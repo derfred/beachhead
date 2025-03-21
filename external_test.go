@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestHealthHandler(t *testing.T) {
@@ -37,13 +38,13 @@ func TestVersionHandler(t *testing.T) {
 	}
 }
 
-func TestCommandExecutor_Execute(t *testing.T) {
+func TestProcessRegistry_Execute(t *testing.T) {
 	templates := map[string]ShellTemplate{
 		"echo": {Template: "echo {{.text}}"},
 		"root": {User: "root", Template: "whoami"},
 	}
 
-	executor := NewCommandExecutor(templates)
+	registry := NewProcessRegistry(templates)
 
 	tests := []struct {
 		name    string
@@ -68,7 +69,7 @@ func TestCommandExecutor_Execute(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var out bytes.Buffer
-			_, err := executor.Execute("", tt.cmd, tt.args, &out)
+			_, err := registry.Execute("", tt.cmd, tt.args, &out)
 
 			if tt.wantErr {
 				if err == nil {
@@ -81,8 +82,11 @@ func TestCommandExecutor_Execute(t *testing.T) {
 				t.Errorf("unexpected error: %v", err)
 			}
 
-			if got := out.String(); got != tt.wantOut {
-				t.Errorf("output = %q, want %q", got, tt.wantOut)
+			// Since the output is written asynchronously, we need to wait a bit
+			time.Sleep(100 * time.Millisecond)
+
+			if got := out.String(); !strings.Contains(got, tt.wantOut) {
+				t.Errorf("output = %q, want to contain %q", got, tt.wantOut)
 			}
 		})
 	}

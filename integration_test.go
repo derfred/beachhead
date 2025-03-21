@@ -201,7 +201,7 @@ func TestUploadDownloadIntegration(t *testing.T) {
 	defer os.RemoveAll(tempWorkspace)
 
 	// Set the workspace
-	server.workspaceCurrent = tempWorkspace
+	server.workspace.current = tempWorkspace
 
 	// Create file content
 	fileContent := []byte("This is a test file.")
@@ -274,6 +274,16 @@ func TestExecIntegration(t *testing.T) {
 	// Wait briefly for the server to start.
 	time.Sleep(500 * time.Millisecond)
 
+	// Create a test workspace first
+	tempWorkspace, err := os.MkdirTemp("", "workspace_test_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp workspace: %v", err)
+	}
+	defer os.RemoveAll(tempWorkspace)
+
+	// Set the workspace
+	server.workspace.current = tempWorkspace
+
 	// Prepare the exec request.
 	reqBody, err := json.Marshal(map[string]string{
 		"args": "Hello Exec",
@@ -289,7 +299,7 @@ func TestExecIntegration(t *testing.T) {
 		},
 	}
 
-	execURL := fmt.Sprintf("https://localhost:%d/exec/echo", server.GetExternalPort())
+	execURL := fmt.Sprintf("https://localhost:%d/workspace/exec/echo", server.GetExternalPort())
 	req, err := http.NewRequest(http.MethodPost, execURL, bytes.NewBuffer(reqBody))
 	if err != nil {
 		t.Fatalf("Failed to create request: %v", err)
@@ -329,6 +339,16 @@ func TestExecWithFilesIntegration(t *testing.T) {
 	go server.Start()
 	defer cleanup()
 	time.Sleep(1 * time.Second)
+
+	// Create a test workspace first
+	tempWorkspace, err := os.MkdirTemp("", "workspace_test_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp workspace: %v", err)
+	}
+	defer os.RemoveAll(tempWorkspace)
+
+	// Set the workspace
+	server.workspace.current = tempWorkspace
 
 	// Create a test file with content
 	testContent := "Hello from test file"
@@ -373,7 +393,7 @@ func TestExecWithFilesIntegration(t *testing.T) {
 	}
 
 	// Make the request
-	url := fmt.Sprintf("https://localhost:%d/exec/cat", server.GetExternalPort())
+	url := fmt.Sprintf("https://localhost:%d/workspace/exec/cat", server.GetExternalPort())
 	req, err := http.NewRequest(http.MethodPost, url, &b)
 	if err != nil {
 		t.Fatalf("Failed to create request: %v", err)
@@ -503,4 +523,197 @@ func TestWorkspaceIntegration(t *testing.T) {
 
 	// Cleanup the workspace directory
 	os.RemoveAll(path)
+}
+
+// TestProcessTerminationIntegration tests the process termination functionality
+func TestProcessTerminationIntegration(t *testing.T) {
+	// Start a server with a sleep command template
+	server, certPool, cleanup := buildServer(t, map[string]ShellTemplate{
+		"sleep": {Template: "sleep {{.duration}}"},
+	})
+	go server.Start()
+	defer cleanup()
+	time.Sleep(1 * time.Second)
+
+	// Create a workspace
+	tempWorkspace, err := os.MkdirTemp("", "workspace_test_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp workspace: %v", err)
+	}
+	defer os.RemoveAll(tempWorkspace)
+	server.workspace.current = tempWorkspace
+
+	// Configure HTTP client
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{RootCAs: certPool},
+		},
+	}
+
+	// Start a long-running sleep process (20 seconds)
+	reqBody, err := json.Marshal(map[string]string{
+		"duration": "20",
+	})
+	if err != nil {
+		t.Fatalf("Failed to marshal JSON: %v", err)
+	}
+
+	execURL := fmt.Sprintf("https://localhost:%d/workspace/exec/sleep", server.GetExternalPort())
+	req, err := http.NewRequest(http.MethodPost, execURL, bytes.NewBuffer(reqBody))
+	if err != nil {
+		t.Fatalf("Failed to create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	// Execute the sleep command in the background
+	go func() {
+		_, err := client.Do(req)
+		if err != nil && !strings.Contains(err.Error(), "EOF") && !strings.Contains(err.Error(), "connection closed") {
+			t.Logf("Sleep command execution error (may be expected if terminated): %v", err)
+		}
+	}()
+
+	// Wait a bit for the process to start
+	time.Sleep(2 * time.Second)
+
+	// Get list of processes
+	processesURL := fmt.Sprintf("https://localhost:%d/workspace/processes", server.GetExternalPort())
+	req, err = http.NewRequest(http.MethodGet, processesURL, nil)
+	if err != nil {
+		t.Fatalf("Failed to create processes list request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to get processes: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Expected status 200 for processes, got %d", resp.StatusCode)
+	}
+
+	// Parse process list to get the ID
+	var processes []map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&processes); err != nil {
+		t.Fatalf("Failed to parse process list: %v", err)
+	}
+
+	if len(processes) == 0 {
+		t.Fatalf("No processes found")
+	}
+
+	// Find sleep process
+	var processID string
+	for _, process := range processes {
+		cmd, ok := process["command"].(string)
+		if ok && strings.Contains(cmd, "sleep") {
+			processID, _ = process["id"].(string)
+			break
+		}
+	}
+
+	if processID == "" {
+		t.Fatalf("Failed to find sleep process in the process list")
+	}
+
+	// Terminate the process
+	terminateURL := fmt.Sprintf("https://localhost:%d/workspace/process/%s", server.GetExternalPort(), processID)
+
+	req, err = http.NewRequest(http.MethodDelete, terminateURL, nil)
+	if err != nil {
+		t.Fatalf("Failed to create termination request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to terminate process: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("Expected status 200 for termination, got %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Verify response
+	var terminateResp map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&terminateResp); err != nil {
+		t.Fatalf("Failed to parse termination response: %v", err)
+	}
+
+	if terminateResp["status"] != "terminated" || terminateResp["id"] != processID {
+		t.Fatalf("Unexpected termination response: %v", terminateResp)
+	}
+
+	// Wait a bit for the termination to take effect
+	time.Sleep(1 * time.Second)
+
+	// Verify the process is no longer in the list
+	req, err = http.NewRequest(http.MethodGet, processesURL, nil)
+	if err != nil {
+		t.Fatalf("Failed to create processes list request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to get processes: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Expected status 200 for processes, got %d", resp.StatusCode)
+	}
+
+	// Check if process is gone or has been terminated
+	var remainingProcesses []map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&remainingProcesses); err != nil {
+		t.Fatalf("Failed to parse process list: %v", err)
+	}
+
+	// Process might still be in the list but it should be terminated
+	if len(remainingProcesses) != 1 {
+		t.Fatalf("Expected 1 processes, got %d", len(remainingProcesses))
+	}
+
+	// Check if the process is terminated
+	// Get the process details to verify termination status
+	processDetailsURL := fmt.Sprintf("https://localhost:%d/workspace/process/%s", server.GetExternalPort(), processID)
+	req, err = http.NewRequest(http.MethodGet, processDetailsURL, nil)
+	if err != nil {
+		t.Fatalf("Failed to create process details request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to get process details: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Process might not be found after termination, which is acceptable
+	if resp.StatusCode == http.StatusNotFound {
+		t.Logf("Process %s no longer exists after termination", processID)
+		return
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Expected status 200 or 404 for process details, got %d", resp.StatusCode)
+	}
+
+	// If the process still exists, verify it has an exit code set
+	var processDetails map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&processDetails); err != nil {
+		t.Fatalf("Failed to parse process details: %v", err)
+	}
+
+	// Check if exit_code is set, indicating the process has terminated
+	_, hasExitCode := processDetails["exit_code"].(float64)
+	if !hasExitCode {
+		t.Fatalf("Process %s does not have an exit code set after termination", processID)
+	}
 }

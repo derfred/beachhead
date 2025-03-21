@@ -9,99 +9,13 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"text/template"
+	"time"
 )
 
-type ExecRequest struct {
-	Args  string          `json:"args"`
-	Files map[string]bool `json:"files"` // map of variable names that will be supplied as files
-}
-
-var version = "0.1"
-
-type CommandExecutor struct {
-	shellTemplates map[string]ShellTemplate
-}
-
-func NewCommandExecutor(templates map[string]ShellTemplate) *CommandExecutor {
-	return &CommandExecutor{
-		shellTemplates: templates,
-	}
-}
-
-func (e *CommandExecutor) Execute(cwd string, cmd string, args map[string]interface{}, w io.Writer) (int, error) {
-	shellTmpl, exists := e.shellTemplates[cmd]
-	if !exists {
-		return 0, fmt.Errorf("command not found: %s", cmd)
-	}
-
-	tmpl, err := template.New("cmd").Parse(shellTmpl.Template)
-	if err != nil {
-		return 0, fmt.Errorf("template parse error: %v", err)
-	}
-
-	var cmdStr bytes.Buffer
-	err = tmpl.Execute(&cmdStr, args)
-	if err != nil {
-		return 0, fmt.Errorf("template execution error: %v", err)
-	}
-
-	finalCmd := cmdStr.String()
-	if shellTmpl.User != "" {
-		finalCmd = "sudo -u " + shellTmpl.User + " " + finalCmd
-	}
-
-	shellcmd := exec.Cmd{
-		Path: "/bin/sh",
-		Args: []string{"sh", "-c", finalCmd},
-		Dir:  cwd,
-	}
-
-	stdout, err := shellcmd.StdoutPipe()
-	if err != nil {
-		return 0, fmt.Errorf("failed to get stdout: %v", err)
-	}
-	stderr, err := shellcmd.StderrPipe()
-	if err != nil {
-		return 0, fmt.Errorf("failed to get stderr: %v", err)
-	}
-
-	if err := shellcmd.Start(); err != nil {
-		return 0, fmt.Errorf("failed to start command: %v", err)
-	}
-
-	reader := io.MultiReader(stdout, stderr)
-	buf := make([]byte, 1024)
-	for {
-		n, err := reader.Read(buf)
-		if err != nil {
-			if err != io.EOF {
-				log.Printf("error reading output: %v", err)
-			}
-			break
-		}
-		if _, err := w.Write(buf[:n]); err != nil {
-			log.Printf("error writing output: %v", err)
-			break
-		}
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
-	}
-
-	err = shellcmd.Wait()
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return exitErr.ExitCode(), nil
-		}
-		return 1, err
-	}
-	return 0, nil
-}
+var version = "0.3"
 
 // HealthHandler responds with 200 OK.
 func HealthHandler(w http.ResponseWriter, r *http.Request) {
@@ -117,6 +31,24 @@ func VersionHandler(w http.ResponseWriter, r *http.Request) {
 	if _, err := w.Write([]byte(version)); err != nil {
 		log.Printf("Error writing version response: %v", err)
 	}
+}
+
+type WorkspaceHandler struct {
+	base            string
+	current         string
+	processRegistry *ProcessRegistry
+}
+
+func NewWorkspaceHandler(workspaceBase string, shellTemplates map[string]ShellTemplate) *WorkspaceHandler {
+	return &WorkspaceHandler{
+		base:            workspaceBase,
+		processRegistry: NewProcessRegistry(shellTemplates),
+	}
+}
+
+type ExecRequest struct {
+	Args  string          `json:"args"`
+	Files map[string]bool `json:"files"` // map of variable names that will be supplied as files
 }
 
 func isMultipartFormRequest(contentType string) bool {
@@ -137,7 +69,7 @@ func createTempFile(originalName string) (*os.File, error) {
 	return os.CreateTemp(tempDir, prefix+"_*"+ext)
 }
 
-func extractCmdArgs(r *http.Request, workspaceBase string) (map[string]interface{}, error, int) {
+func extractCmdArgs(r *http.Request, workspaceBase string) (map[string]interface{}, int, error) {
 	var requestData map[string]interface{}
 
 	// Check the content type of the request
@@ -148,22 +80,22 @@ func extractCmdArgs(r *http.Request, workspaceBase string) (map[string]interface
 		// Read the request body
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
-			return nil, err, http.StatusInternalServerError
+			return nil, http.StatusInternalServerError, err
 		}
 		defer r.Body.Close()
 
 		// Unmarshal the JSON into a nested map
 		err = json.Unmarshal(body, &requestData)
 		if err != nil {
-			return nil, err, http.StatusBadRequest
+			return nil, http.StatusBadRequest, err
 		}
-		return requestData, nil, http.StatusOK
+		return requestData, http.StatusOK, nil
 	} else if isMultipartFormRequest(contentType) {
 		// Handle multipart form request
 		// Parse the multipart form with a reasonable max memory
 		err := r.ParseMultipartForm(10 << 20) // 10 MB max memory
 		if err != nil {
-			return nil, err, http.StatusBadRequest
+			return nil, http.StatusBadRequest, err
 		}
 
 		// Initialize the request data map
@@ -175,7 +107,7 @@ func extractCmdArgs(r *http.Request, workspaceBase string) (map[string]interface
 		if jsonData != "" {
 			err = json.Unmarshal([]byte(jsonData), &requestData)
 			if err != nil {
-				return nil, err, http.StatusBadRequest
+				return nil, http.StatusBadRequest, err
 			}
 		}
 
@@ -185,76 +117,35 @@ func extractCmdArgs(r *http.Request, workspaceBase string) (map[string]interface
 				// Open the uploaded file
 				file, err := fileHeader.Open()
 				if err != nil {
-					return nil, err, http.StatusInternalServerError
+					return nil, http.StatusInternalServerError, err
 				}
 				defer file.Close()
 
 				// Create a temporary file to store the upload
 				tempFile, err := createTempFile(fileHeader.Filename)
 				if err != nil {
-					return nil, err, http.StatusInternalServerError
+					return nil, http.StatusInternalServerError, err
 				}
 				defer tempFile.Close()
 
 				// Copy the uploaded file to the temporary file
 				_, err = io.Copy(tempFile, file)
 				if err != nil {
-					return nil, err, http.StatusInternalServerError
+					return nil, http.StatusInternalServerError, err
 				}
 
 				// Add the file location to the request data map
 				requestData[fileName] = tempFile.Name()
 			}
 		}
-		return requestData, nil, http.StatusOK
+		return requestData, http.StatusOK, nil
 	} else {
-		return nil, fmt.Errorf("unsupported content type. Use application/json or multipart/form-data"), http.StatusUnsupportedMediaType
-	}
-}
-
-// Replace ExecHandler with MakeExecHandler that uses a passed-in shellTemplates
-func MakeExecHandler(shellTemplates map[string]ShellTemplate, server *Server) http.HandlerFunc {
-	executor := NewCommandExecutor(shellTemplates)
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		cmd := strings.TrimPrefix(r.URL.Path, "/exec/")
-		if cmd == "" {
-			http.Error(w, "command name is required", http.StatusBadRequest)
-			return
-		}
-
-		if _, exists := shellTemplates[cmd]; !exists {
-			http.Error(w, fmt.Sprintf("command not found: %s", cmd), http.StatusNotFound)
-			return
-		}
-
-		args, err, status := extractCmdArgs(r, server.workspaceBase)
-		if err != nil {
-			http.Error(w, err.Error(), status)
-			return
-		}
-
-		w.Header().Set("Trailer", "X-Exit-Code")
-		w.Header().Set("Content-Type", "text/plain")
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
-
-		exitCode, err := executor.Execute(server.workspaceCurrent, cmd, args, w)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("X-Exit-Code", strconv.Itoa(exitCode))
+		return nil, http.StatusUnsupportedMediaType, fmt.Errorf("unsupported content type. Use application/json or multipart/form-data")
 	}
 }
 
 // WorkspaceHandler extracts a zip file from the request into a temp directory.
-func MakeWorkspaceHandler(server *Server) http.HandlerFunc {
+func (workspace *WorkspaceHandler) CreateWorkspaceHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -288,8 +179,10 @@ func MakeWorkspaceHandler(server *Server) http.HandlerFunc {
 			return
 		}
 
-		// Create a new temporary directory inside the workspace base.
-		tmpDir, err := os.MkdirTemp(server.workspaceBase, "workspace_*")
+		// Create a new temporary directory inside the workspace base with timestamp suffix.
+		timestamp := time.Now().Format("20060102_150405")
+		tmpDir := filepath.Join(workspace.base, "workspace_"+timestamp)
+		err = os.MkdirAll(tmpDir, os.ModePerm)
 		if err != nil {
 			http.Error(w, "Failed to create temp dir: "+err.Error(), http.StatusInternalServerError)
 			return
@@ -340,7 +233,7 @@ func MakeWorkspaceHandler(server *Server) http.HandlerFunc {
 			}
 
 			// now set the workspaceCurrent to the new workspace
-			server.workspaceCurrent = tmpDir
+			workspace.current = tmpDir
 		}
 
 		// For future operations, the new workspace base is now tmpDir.
@@ -351,14 +244,14 @@ func MakeWorkspaceHandler(server *Server) http.HandlerFunc {
 	}
 }
 
-func MakeWorkspaceUploadHandler(server *Server) http.HandlerFunc {
+func (workspace *WorkspaceHandler) MakeWorkspaceUploadHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
-		if server.workspaceCurrent == "" {
+		if workspace.current == "" {
 			http.Error(w, "No workspace set", http.StatusBadRequest)
 			return
 		}
@@ -369,9 +262,9 @@ func MakeWorkspaceUploadHandler(server *Server) http.HandlerFunc {
 			return
 		}
 
-		targetPath := filepath.Join(server.workspaceCurrent, filename)
+		targetPath := filepath.Join(workspace.current, filename)
 		// Prevent path traversal
-		if !strings.HasPrefix(targetPath, server.workspaceCurrent) {
+		if !strings.HasPrefix(targetPath, workspace.current) {
 			http.Error(w, "Invalid path", http.StatusBadRequest)
 			return
 		}
@@ -401,14 +294,14 @@ func MakeWorkspaceUploadHandler(server *Server) http.HandlerFunc {
 	}
 }
 
-func MakeWorkspaceDownloadHandler(server *Server) http.HandlerFunc {
+func (workspace *WorkspaceHandler) MakeWorkspaceDownloadHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
-		if server.workspaceCurrent == "" {
+		if workspace.current == "" {
 			http.Error(w, "No workspace set", http.StatusBadRequest)
 			return
 		}
@@ -419,9 +312,9 @@ func MakeWorkspaceDownloadHandler(server *Server) http.HandlerFunc {
 			return
 		}
 
-		filePath := filepath.Join(server.workspaceCurrent, filename)
+		filePath := filepath.Join(workspace.current, filename)
 		// Prevent path traversal
-		if !strings.HasPrefix(filePath, server.workspaceCurrent) {
+		if !strings.HasPrefix(filePath, workspace.current) {
 			http.Error(w, "Invalid path", http.StatusBadRequest)
 			return
 		}
@@ -451,5 +344,128 @@ func MakeWorkspaceDownloadHandler(server *Server) http.HandlerFunc {
 		if _, err := io.Copy(w, file); err != nil {
 			log.Printf("Error while sending file: %v", err)
 		}
+	}
+}
+
+func (workspace *WorkspaceHandler) MakeExecHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		if workspace.current == "" {
+			http.Error(w, "No workspace set", http.StatusBadRequest)
+			return
+		}
+
+		cmd := strings.TrimPrefix(r.URL.Path, "/workspace/exec/")
+		if cmd == "" {
+			http.Error(w, "command name is required", http.StatusBadRequest)
+			return
+		}
+
+		if !workspace.processRegistry.HasShellTemplate(cmd) {
+			http.Error(w, fmt.Sprintf("command not found: %s", cmd), http.StatusNotFound)
+			return
+		}
+
+		args, status, err := extractCmdArgs(r, workspace.base)
+		if err != nil {
+			http.Error(w, err.Error(), status)
+			return
+		}
+
+		// Get follow parameter from query string instead of request body
+		followOutput := true
+		followParam := r.URL.Query().Get("follow")
+		if followParam != "" {
+			followOutput = followParam != "false" && followParam != "0"
+		}
+
+		// Set Content-Type header
+		w.Header().Set("Content-Type", "text/plain")
+
+		// Setup output writer based on followOutput flag
+		var outputWriter io.Writer
+		if followOutput {
+			outputWriter = w
+
+			w.Header().Set("Trailer", "X-Exit-Code")
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+
+		// Execute the command
+		process, err := workspace.processRegistry.Execute(workspace.current, cmd, args, outputWriter)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		// Set Location header pointing to the process endpoint
+		w.Header().Set("Location", fmt.Sprintf("/workspace/process/%s", process.ID))
+
+		if followOutput {
+			exitCode := process.Wait()
+			w.Header().Set("X-Exit-Code", strconv.Itoa(exitCode))
+		} else {
+			w.WriteHeader(http.StatusAccepted)
+		}
+	}
+}
+
+// MakeProcessListHandler creates an HTTP handler to list all processes
+func (workspace *WorkspaceHandler) MakeProcessListHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		processes := workspace.processRegistry.ListProcesses()
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(processes); err != nil {
+			http.Error(w, "Failed to encode process list", http.StatusInternalServerError)
+		}
+	}
+}
+
+// MakeProcessDetailsHandler creates an HTTP handler to get details about a specific process
+func (workspace *WorkspaceHandler) ProcessDetailsHandler(w http.ResponseWriter, process *ProcessInfo) {
+	// Build the response data
+	process.Lock.Lock()
+	resp := map[string]interface{}{
+		"id":           process.ID,
+		"command":      process.Command,
+		"pid":          process.PID,
+		"start_time":   process.StartTime,
+		"running_time": time.Since(process.StartTime).String(),
+		"exit_code":    process.ExitCode,
+	}
+	process.Lock.Unlock()
+
+	// Return JSON response
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		http.Error(w, "Failed to encode process details", http.StatusInternalServerError)
+	}
+}
+
+// MakeProcessTerminateHandler creates an HTTP handler for terminating a process
+func (workspace *WorkspaceHandler) ProcessTerminateHandler(w http.ResponseWriter, process *ProcessInfo) {
+	// Call the ProcessRegistry to terminate the process
+	if err := workspace.processRegistry.TerminateProcess(process.ID); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to terminate process: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Return success response
+	w.WriteHeader(http.StatusOK)
+	resp := map[string]string{"status": "terminated", "id": process.ID}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		log.Printf("Error encoding termination response: %v", err)
 	}
 }
