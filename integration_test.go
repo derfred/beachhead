@@ -717,3 +717,107 @@ func TestProcessTerminationIntegration(t *testing.T) {
 		t.Fatalf("Process %s does not have an exit code set after termination", processID)
 	}
 }
+
+// TestProcessOutputFollowIntegration tests the ability to follow process output
+func TestProcessOutputFollowIntegration(t *testing.T) {
+	// Start a server with echo command template
+	server, certPool, cleanup := buildServer(t, map[string]ShellTemplate{
+		"echo": {Template: "echo '{{.message}}' && sleep 1 && echo '{{.message2}}'"},
+	})
+	go server.Start()
+	defer cleanup()
+	time.Sleep(1 * time.Second)
+
+	// Create a workspace
+	tempWorkspace, err := os.MkdirTemp("", "workspace_test_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp workspace: %v", err)
+	}
+	defer os.RemoveAll(tempWorkspace)
+	server.workspace.current = tempWorkspace
+
+	// Configure HTTP client
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{RootCAs: certPool},
+		},
+		// Don't follow redirects automatically
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// Start an echo process without following the output
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"message":  "First Message",
+		"message2": "Second Message",
+	})
+	if err != nil {
+		t.Fatalf("Failed to marshal JSON: %v", err)
+	}
+
+	execURL := fmt.Sprintf("https://localhost:%d/workspace/exec/echo?follow=false", server.GetExternalPort())
+	req, err := http.NewRequest(http.MethodPost, execURL, bytes.NewBuffer(reqBody))
+	if err != nil {
+		t.Fatalf("Failed to create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	// Execute the command
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to execute command: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("Expected status 202, got %d", resp.StatusCode)
+	}
+
+	// Get the process ID from the Location header
+	locationHeader := resp.Header.Get("Location")
+	if locationHeader == "" {
+		t.Fatalf("No Location header returned")
+	}
+	processID := strings.TrimPrefix(locationHeader, "/workspace/process/")
+
+	// Now follow the output using the new endpoint
+	outputURL := fmt.Sprintf("https://localhost:%d/workspace/process/%s/output", server.GetExternalPort(), processID)
+	req, err = http.NewRequest(http.MethodGet, outputURL, nil)
+	if err != nil {
+		t.Fatalf("Failed to create output request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	outputResp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to follow output: %v", err)
+	}
+	defer outputResp.Body.Close()
+
+	if outputResp.StatusCode != http.StatusOK {
+		t.Fatalf("Expected status 200 for output, got %d", outputResp.StatusCode)
+	}
+
+	// Read the output
+	outputContent, err := io.ReadAll(outputResp.Body)
+	if err != nil {
+		t.Fatalf("Failed to read output: %v", err)
+	}
+
+	// Verify the output contains both messages
+	output := string(outputContent)
+	if !strings.Contains(output, "First Message") {
+		t.Errorf("Output does not contain 'First Message': %s", output)
+	}
+	if !strings.Contains(output, "Second Message") {
+		t.Errorf("Output does not contain 'Second Message': %s", output)
+	}
+
+	// Verify the exit code
+	exitCode := outputResp.Trailer.Get("X-Exit-Code")
+	if exitCode != "0" {
+		t.Errorf("Expected exit code 0, got %s", exitCode)
+	}
+}

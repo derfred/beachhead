@@ -88,6 +88,11 @@ func NewServer(cfg config) *Server {
 			return
 		}
 
+		isOutput := strings.HasSuffix(processID, "/output")
+		if isOutput {
+			processID = strings.TrimSuffix(processID, "/output")
+		}
+
 		// Call the ProcessRegistry to get the process
 		process, exists := result.workspace.processRegistry.GetProcess(processID)
 		if !exists {
@@ -98,8 +103,11 @@ func NewServer(cfg config) *Server {
 		// Route based on HTTP method
 		switch r.Method {
 		case http.MethodGet:
-			// GET requests are handled by the details handler
-			result.workspace.ProcessDetailsHandler(w, process)
+			if isOutput {
+				result.workspace.ProcessOutputHandler(w, process)
+			} else {
+				result.workspace.ProcessDetailsHandler(w, process)
+			}
 		case http.MethodDelete:
 			// DELETE requests are handled by the terminate handler
 			result.workspace.ProcessTerminateHandler(w, process)

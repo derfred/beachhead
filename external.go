@@ -469,3 +469,30 @@ func (workspace *WorkspaceHandler) ProcessTerminateHandler(w http.ResponseWriter
 		log.Printf("Error encoding termination response: %v", err)
 	}
 }
+
+// ProcessOutputHandler creates an HTTP handler for streaming process output
+func (workspace *WorkspaceHandler) ProcessOutputHandler(w http.ResponseWriter, process *ProcessInfo) {
+	// Set content type to plaintext
+	w.Header().Set("Content-Type", "text/plain")
+	w.Header().Set("Trailer", "X-Exit-Code")
+
+	// Create a buffered writer to improve performance
+	writer := w
+
+	// Add the writer to the process's list of writers
+	if err := workspace.processRegistry.AddWriterToProcess(process.ID, writer); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to attach to process output: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Make sure to flush the initial headers
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+
+	// Wait for the process to complete
+	exitCode := process.Wait()
+
+	// Set the exit code in the trailer
+	w.Header().Set("X-Exit-Code", strconv.Itoa(exitCode))
+}
