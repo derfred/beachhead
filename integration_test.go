@@ -566,16 +566,27 @@ func TestProcessTerminationIntegration(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer test-token")
 
+	// Create a channel to capture any errors from the background goroutine
+	errCh := make(chan string, 1)
+
 	// Execute the sleep command in the background
-	go func() {
+	go func(errCh chan<- string) {
 		_, err := client.Do(req)
 		if err != nil && !strings.Contains(err.Error(), "EOF") && !strings.Contains(err.Error(), "connection closed") {
-			t.Logf("Sleep command execution error (may be expected if terminated): %v", err)
+			errCh <- fmt.Sprintf("Sleep command execution error (may be expected if terminated): %v", err)
 		}
-	}()
+	}(errCh)
 
 	// Wait a bit for the process to start
 	time.Sleep(2 * time.Second)
+
+	// Check for any errors from the goroutine (non-blocking)
+	select {
+	case errMsg := <-errCh:
+		t.Logf("%s", errMsg)
+	default:
+		// No error, continue
+	}
 
 	// Get list of processes
 	processesURL := fmt.Sprintf("https://localhost:%d/workspace/processes", server.GetExternalPort())

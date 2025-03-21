@@ -7,7 +7,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestHealthHandler(t *testing.T) {
@@ -69,7 +68,7 @@ func TestProcessRegistry_Execute(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var out bytes.Buffer
-			_, err := registry.Execute("", tt.cmd, tt.args, &out)
+			proc, err := registry.Execute("", tt.cmd, tt.args, &out)
 
 			if tt.wantErr {
 				if err == nil {
@@ -80,10 +79,11 @@ func TestProcessRegistry_Execute(t *testing.T) {
 
 			if err != nil {
 				t.Errorf("unexpected error: %v", err)
+				return
 			}
 
-			// Since the output is written asynchronously, we need to wait a bit
-			time.Sleep(100 * time.Millisecond)
+			// Wait for the command to finish instead of using sleep
+			proc.Wait()
 
 			if got := out.String(); !strings.Contains(got, tt.wantOut) {
 				t.Errorf("output = %q, want to contain %q", got, tt.wantOut)

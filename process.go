@@ -28,6 +28,9 @@ type ProcessInfo struct {
 
 // WriteToAllProcessWriters writes to all writers in a process
 func (p *ProcessInfo) WriteToAllProcessWriters(data []byte) {
+	p.Lock.Lock()
+	defer p.Lock.Unlock()
+
 	for _, writer := range p.Writers {
 		writer.Write(data)
 
@@ -38,6 +41,7 @@ func (p *ProcessInfo) WriteToAllProcessWriters(data []byte) {
 	}
 }
 
+// Wait blocks until the process is done and returns its exit code
 func (p *ProcessInfo) Wait() int {
 	p.Done.L.Lock()
 	defer p.Done.L.Unlock()
@@ -237,7 +241,9 @@ func (r *ProcessRegistry) Execute(cwd string, cmd string, args map[string]interf
 			processInfo.ExitCode = 0
 			processInfo.Lock.Unlock()
 		}
+		processInfo.Done.L.Lock()
 		processInfo.Done.Broadcast()
+		processInfo.Done.L.Unlock()
 	}()
 
 	return processInfo, nil
