@@ -13,32 +13,116 @@ import (
 	"time"
 )
 
-// ThreadSafeWriter wraps an io.Writer with a mutex to make it thread-safe
-type ThreadSafeWriter struct {
-	writer io.Writer
-	mutex  sync.Mutex
+// MarkupWriter provides a thread-safe writer with optional markup capabilities
+type MarkupWriter struct {
+	writer        io.Writer
+	mutex         sync.Mutex
+	markupMode    bool
+	isOutputOpen  bool
+	lastWriteTime time.Time
+	stopChan      chan struct{}
 }
 
-// NewThreadSafeWriter creates a new thread-safe writer
-func NewThreadSafeWriter(w io.Writer) *ThreadSafeWriter {
-	return &ThreadSafeWriter{
-		writer: w,
+// NewMarkupWriter creates a new MarkupWriter
+func NewMarkupWriter(w io.Writer, useMarkup bool) *MarkupWriter {
+	mw := &MarkupWriter{
+		writer:        w,
+		markupMode:    useMarkup,
+		isOutputOpen:  false,
+		lastWriteTime: time.Now(),
+		stopChan:      make(chan struct{}),
+	}
+
+	// Start the keepalive goroutine if using markup mode
+	if useMarkup {
+		go mw.keepaliveMonitor()
+	}
+
+	return mw
+}
+
+// Write implements the io.Writer interface with optional markup
+func (w *MarkupWriter) Write(p []byte) (n int, err error) {
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+
+	// Update the last write time
+	w.lastWriteTime = time.Now()
+
+	if w.markupMode {
+		// If using markup mode and not currently in an output segment, start one
+		if !w.isOutputOpen {
+			if _, err := w.writer.Write([]byte("<output>\n")); err != nil {
+				return 0, err
+			}
+			w.isOutputOpen = true
+		}
+	}
+
+	// Write the actual data
+	n, err = w.writer.Write(p)
+
+	// Flush the output
+	w.Flush()
+
+	return n, err
+}
+
+// Flush flushes the underlying writer
+func (w *MarkupWriter) Flush() {
+	if f, ok := w.writer.(http.Flusher); ok {
+		f.Flush()
 	}
 }
 
-// Write implements the io.Writer interface in a thread-safe manner
-func (w *ThreadSafeWriter) Write(p []byte) (n int, err error) {
+// Close closes any open output segment and stops the keepalive monitor if in markup mode
+func (w *MarkupWriter) Close() {
 	w.mutex.Lock()
 	defer w.mutex.Unlock()
-	return w.writer.Write(p)
+
+	if !w.markupMode {
+		return
+	}
+
+	// Send the stop signal to the keepalive goroutine
+	close(w.stopChan)
+
+	// Close any open output segment
+	if w.isOutputOpen {
+		if _, err := w.writer.Write([]byte("</output>\n")); err != nil {
+			log.Printf("Error writing closing output tag: %v", err)
+		}
+		w.isOutputOpen = false
+	}
+
+	w.Flush()
 }
 
-// Flush implements the http.Flusher interface if the underlying writer supports it
-func (w *ThreadSafeWriter) Flush() {
-	w.mutex.Lock()
-	defer w.mutex.Unlock()
-	if f, ok := w.writer.(http.Flusher); ok {
-		f.Flush()
+// keepaliveMonitor runs in a separate goroutine to monitor for inactivity and send keepalives
+func (w *MarkupWriter) keepaliveMonitor() {
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-w.stopChan:
+			return
+		case <-ticker.C:
+			w.mutex.Lock()
+			if time.Since(w.lastWriteTime) > 15*time.Second {
+				if w.isOutputOpen {
+					if _, err := w.writer.Write([]byte("</output>\n")); err != nil {
+						log.Printf("Error writing closing output tag: %v", err)
+					}
+					w.isOutputOpen = false
+				}
+				if _, err := w.writer.Write([]byte("<keepalive/>\n")); err != nil {
+					log.Printf("Error writing keepalive: %v", err)
+				}
+				w.Flush()
+			}
+			w.mutex.Unlock()
+		}
 	}
 }
 
@@ -66,9 +150,9 @@ func (p *ProcessInfo) WriteToAllProcessWriters(data []byte) {
 			continue
 		}
 
-		// Try to flush if it's a ThreadSafeWriter
-		if tsw, ok := writer.(*ThreadSafeWriter); ok {
-			tsw.Flush()
+		// Try to flush if it's a MarkupWriter
+		if mw, ok := writer.(*MarkupWriter); ok {
+			mw.Flush()
 		}
 	}
 }

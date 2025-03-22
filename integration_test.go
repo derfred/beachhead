@@ -3,6 +3,7 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -839,4 +840,265 @@ func TestProcessOutputFollowIntegration(t *testing.T) {
 	if exitCode != "0" {
 		t.Errorf("Expected exit code 0, got %s", exitCode)
 	}
+}
+
+// TestProcessMarkupProtocolIntegration tests the processml markup protocol including keepalives
+func TestProcessMarkupProtocolIntegration(t *testing.T) {
+	// Start a server with a command template that includes delays to trigger keepalives
+	server, certPool, cleanup := buildServer(t, map[string]ShellTemplate{
+		"test_markup": {Template: "echo 'Initial output' && sleep 20 && echo 'After keepalive' && sleep 16 && echo 'Final output'"},
+	})
+	go server.Start()
+	defer cleanup()
+	time.Sleep(1 * time.Second)
+
+	// Create a workspace
+	tempWorkspace, err := os.MkdirTemp("", "workspace_test_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp workspace: %v", err)
+	}
+	defer os.RemoveAll(tempWorkspace)
+	server.workspace.current = tempWorkspace
+
+	// Configure HTTP client
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{RootCAs: certPool},
+		},
+	}
+
+	// Start the process
+	execURL := fmt.Sprintf("https://localhost:%d/workspace/exec/test_markup", server.GetExternalPort())
+	req, err := http.NewRequest(http.MethodPost, execURL, bytes.NewBuffer([]byte("{}")))
+	if err != nil {
+		t.Fatalf("Failed to create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Accept", "application/processml")
+
+	// Execute the command with markup
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to execute command: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Expected status 200, got %d", resp.StatusCode)
+	}
+
+	// Verify the Content-Type header
+	contentType := resp.Header.Get("Content-Type")
+	if contentType != "application/processml" {
+		t.Errorf("Expected Content-Type 'application/processml', got '%s'", contentType)
+	}
+
+	// Read the output
+	outputContent, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("Failed to read output: %v", err)
+	}
+	output := string(outputContent)
+
+	// Verify the output structure follows the markup protocol
+	if !strings.Contains(output, "<output>") {
+		t.Errorf("Output does not contain opening <output> tag: %s", output)
+	}
+	if !strings.Contains(output, "</output>") {
+		t.Errorf("Output does not contain closing </output> tag: %s", output)
+	}
+	if !strings.Contains(output, "Initial output") {
+		t.Errorf("Output does not contain 'Initial output': %s", output)
+	}
+	if !strings.Contains(output, "After keepalive") {
+		t.Errorf("Output does not contain 'After keepalive': %s", output)
+	}
+	if !strings.Contains(output, "Final output") {
+		t.Errorf("Output does not contain 'Final output': %s", output)
+	}
+
+	// Verify keepalives
+	keepaliveCount := strings.Count(output, "<keepalive/>")
+	if keepaliveCount < 1 {
+		t.Errorf("Expected at least 1 keepalive, found %d: %s", keepaliveCount, output)
+	}
+
+	// Verify exit code
+	exitCode := resp.Trailer.Get("X-Exit-Code")
+	if exitCode != "0" {
+		t.Errorf("Expected exit code 0, got %s", exitCode)
+	}
+
+	// Verify the structure of the markup with a more detailed check
+	segments := strings.Split(output, "</output>")
+	if len(segments) < 2 { // At least one output segment should be closed
+		t.Errorf("Expected at least one closed output segment, found %d segments", len(segments))
+	}
+
+	// Validate the sequence of tags and content
+	hasInitialOutput := false
+	hasKeepalive := false
+	hasAfterKeepalive := false
+
+	// First segment should contain <output>Initial output
+	if len(segments) > 0 && strings.Contains(segments[0], "<output>") && strings.Contains(segments[0], "Initial output") {
+		hasInitialOutput = true
+	}
+
+	// We should find a <keepalive/> followed by <output>After keepalive
+	for i, segment := range segments {
+		if i == len(segments)-1 && segment == "" {
+			// Last segment might be empty after the last closing tag
+			continue
+		}
+
+		// Check for keepalive followed by output tag
+		if strings.Contains(segment, "<keepalive/>") {
+			hasKeepalive = true
+
+			// Check if this or the next segment contains "After keepalive"
+			if strings.Contains(segment, "After keepalive") {
+				hasAfterKeepalive = true
+			} else if i+1 < len(segments) && strings.Contains(segments[i+1], "After keepalive") {
+				hasAfterKeepalive = true
+			}
+		}
+	}
+
+	if !hasInitialOutput {
+		t.Errorf("Could not find initial output in expected format")
+	}
+
+	if !hasKeepalive {
+		t.Errorf("Could not find keepalive in expected format")
+	}
+
+	if !hasAfterKeepalive {
+		t.Errorf("Could not find 'After keepalive' text after a keepalive")
+	}
+
+	// Also test the ProcessOutputHandler by starting another process and following its output
+	testProcessOutputWithMarkup(t, server, certPool, tempWorkspace)
+}
+
+// testProcessOutputWithMarkup tests the ProcessOutputHandler with markup protocol
+func testProcessOutputWithMarkup(t *testing.T, server *Server, certPool *x509.CertPool, workspace string) {
+	// Configure HTTP client
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{RootCAs: certPool},
+		},
+		// Don't follow redirects automatically
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// Start a long-running process without following output initially
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"duration": "35", // Long enough to ensure we'll see multiple keepalives
+	})
+	if err != nil {
+		t.Fatalf("Failed to marshal JSON: %v", err)
+	}
+
+	// Add sleep command template if not already there
+	if _, ok := server.workspace.processRegistry.shellTemplates["sleep"]; !ok {
+		server.workspace.processRegistry.shellTemplates["sleep"] = ShellTemplate{
+			Template: "sleep {{.duration}}",
+		}
+	}
+
+	// Start the process without following output
+	execURL := fmt.Sprintf("https://localhost:%d/workspace/exec/sleep?follow=false", server.GetExternalPort())
+	req, err := http.NewRequest(http.MethodPost, execURL, bytes.NewBuffer(reqBody))
+	if err != nil {
+		t.Fatalf("Failed to create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to start process: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("Expected status 202, got %d", resp.StatusCode)
+	}
+
+	// Get the process ID from the Location header
+	locationHeader := resp.Header.Get("Location")
+	if locationHeader == "" {
+		t.Fatalf("No Location header returned")
+	}
+	processID := strings.TrimPrefix(locationHeader, "/workspace/process/")
+
+	// Now follow the output with markup protocol
+	outputURL := fmt.Sprintf("https://localhost:%d/workspace/process/%s/output", server.GetExternalPort(), processID)
+	req, err = http.NewRequest(http.MethodGet, outputURL, nil)
+	if err != nil {
+		t.Fatalf("Failed to create output request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Accept", "application/processml")
+
+	// Create a context with timeout to avoid waiting for the entire sleep
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	req = req.WithContext(ctx)
+
+	outputResp, err := client.Do(req)
+	// We expect the context to time out, so don't treat it as an error
+	if err != nil && !strings.Contains(err.Error(), "context deadline exceeded") {
+		t.Fatalf("Failed to follow output: %v", err)
+	}
+
+	// If we got a response, check its structure
+	if outputResp != nil && outputResp.Body != nil {
+		defer outputResp.Body.Close()
+
+		if outputResp.StatusCode != http.StatusOK {
+			t.Fatalf("Expected status 200 for output, got %d", outputResp.StatusCode)
+		}
+
+		// Verify Content-Type
+		contentType := outputResp.Header.Get("Content-Type")
+		if contentType != "application/processml" {
+			t.Errorf("Expected Content-Type 'application/processml', got '%s'", contentType)
+		}
+
+		// Try to read some of the output before the timeout
+		outputContent, err := io.ReadAll(outputResp.Body)
+		if err != nil && !strings.Contains(err.Error(), "context deadline exceeded") {
+			t.Logf("Note: Could not read full output due to timeout (expected): %v", err)
+		}
+
+		output := string(outputContent)
+
+		// Even with partial output, we should see the opening tag and at least one keepalive
+		if !strings.Contains(output, "<output>") && !strings.Contains(output, "<keepalive/>") {
+			t.Errorf("Output does not contain opening <output> or <keepalive/> tag: %s", output)
+		}
+
+		// Since we're not sending any actual output, we should get at least one keepalive
+		// after 15 seconds
+		keepaliveCount := strings.Count(output, "<keepalive/>")
+		if keepaliveCount < 1 {
+			t.Errorf("Expected at least 1 keepalive, found %d: %s", keepaliveCount, output)
+		}
+	}
+
+	// Clean up by terminating the process
+	terminateURL := fmt.Sprintf("https://localhost:%d/workspace/process/%s", server.GetExternalPort(), processID)
+	req, err = http.NewRequest(http.MethodDelete, terminateURL, nil)
+	if err != nil {
+		t.Fatalf("Failed to create termination request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	// Ignore errors on termination - the process might have finished already due to the timeout
+	client.Do(req)
 }

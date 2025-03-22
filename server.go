@@ -104,7 +104,7 @@ func NewServer(cfg config) *Server {
 		switch r.Method {
 		case http.MethodGet:
 			if isOutput {
-				result.workspace.ProcessOutputHandler(w, process)
+				result.workspace.ProcessOutputHandler(w, r, process)
 			} else {
 				result.workspace.ProcessDetailsHandler(w, process)
 			}
