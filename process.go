@@ -157,23 +157,34 @@ type ProcessInfo struct {
 	Done      *sync.Cond // Cond for thread safety
 }
 
-// WriteToAllProcessWriters writes to all writers in a process
-func (p *ProcessInfo) WriteToAllProcessWriters(data []byte) {
-	p.Lock.Lock()
-	defer p.Lock.Unlock()
+func (p *ProcessInfo) Copy(r io.Reader) {
+	buf := make([]byte, 1024)
 
-	for _, writer := range p.Writers {
-		if _, err := writer.Write(data); err != nil {
-			log.Printf("Error writing to output: %v", err)
-			continue
+	for {
+		n, err := r.Read(buf)
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("error reading output: %v", err)
+			}
+			break
 		}
 
-		// Try to flush if it's a MarkupWriter
-		if mw, ok := writer.(*MarkupWriter); ok {
-			mw.Flush()
+		// Write to all attached writers
+		p.Lock.Lock()
+		for _, writer := range p.Writers {
+			if _, err := writer.Write(buf[:n]); err != nil {
+				log.Printf("Error writing to output: %v", err)
+				continue
+			}
+
+			// Try to flush if it's a MarkupWriter
+			if mw, ok := writer.(*MarkupWriter); ok {
+				mw.Flush()
+			}
 		}
+		p.Lines += bytes.Count(buf[:n], []byte("\n"))
+		p.Lock.Unlock()
 	}
-	p.Lines += bytes.Count(data, []byte("\n"))
 }
 
 // Wait blocks until the process is done and returns its exit code
@@ -308,6 +319,8 @@ func (r *ProcessRegistry) TerminateProcess(id string) error {
 		}
 	}
 
+	process.Cmd.Wait()
+
 	return nil
 }
 
@@ -357,23 +370,9 @@ func (r *ProcessRegistry) Execute(cwd string, cmd string, args map[string]interf
 	processInfo.PID = shellcmd.Process.Pid
 
 	// Start a goroutine to read output and write to all writers
+	go processInfo.Copy(stdout)
+	go processInfo.Copy(stderr)
 	go func() {
-		reader := io.MultiReader(stdout, stderr)
-		buf := make([]byte, 1024)
-
-		for {
-			n, err := reader.Read(buf)
-			if err != nil {
-				if err != io.EOF {
-					log.Printf("error reading output: %v", err)
-				}
-				break
-			}
-
-			// Write to all attached writers
-			processInfo.WriteToAllProcessWriters(buf[:n])
-		}
-
 		// Wait for the command to finish
 		err = shellcmd.Wait()
 		exitCode := 0
