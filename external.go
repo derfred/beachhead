@@ -388,10 +388,6 @@ func (workspace *WorkspaceHandler) MakeExecHandler() http.HandlerFunc {
 		var outputWriter io.Writer
 		if followOutput {
 			outputWriter = workspace.startResponse(w, r)
-
-			if f, ok := w.(http.Flusher); ok {
-				f.Flush()
-			}
 		}
 
 		// Execute the command
@@ -403,6 +399,10 @@ func (workspace *WorkspaceHandler) MakeExecHandler() http.HandlerFunc {
 
 		// Set Location header pointing to the process endpoint
 		w.Header().Set("Location", fmt.Sprintf("/workspace/process/%s", process.ID))
+
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
 
 		if followOutput {
 			exitCode := process.Wait()

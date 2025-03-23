@@ -85,7 +85,7 @@ func (w *MarkupWriter) Close(exitCode int) {
 	// Close any open output segment
 	w.closeSegment()
 
-	if exitCode != 0 {
+	if exitCode != -1 {
 		if _, err := w.writer.Write([]byte("<exitcode>" + strconv.Itoa(exitCode) + "</exitcode>\n")); err != nil {
 			log.Printf("Error writing exitcode: %v", err)
 		}
