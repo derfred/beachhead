@@ -409,7 +409,7 @@ func (workspace *WorkspaceHandler) MakeExecHandler() http.HandlerFunc {
 
 			// If we have a markup writer, close it
 			if markupWriter, ok := outputWriter.(*MarkupWriter); ok {
-				markupWriter.Close()
+				markupWriter.Close(exitCode)
 			}
 
 			w.Header().Set("X-Exit-Code", strconv.Itoa(exitCode))
@@ -478,23 +478,25 @@ func (workspace *WorkspaceHandler) ProcessOutputHandler(w http.ResponseWriter, r
 	// Start the response and get the appropriate writer
 	writer := workspace.startResponse(w, r)
 
-	// Add the writer to the process's list of writers
-	if err := workspace.processRegistry.AddWriterToProcess(process.ID, writer); err != nil {
-		http.Error(w, fmt.Sprintf("Failed to attach to process output: %v", err), http.StatusInternalServerError)
-		return
+	if process.ExitCode == -1 {
+		// Add the writer to the process's list of writers
+		if err := workspace.processRegistry.AddWriterToProcess(process.ID, writer); err != nil {
+			http.Error(w, fmt.Sprintf("Failed to attach to process output: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		// Make sure to flush the initial headers
+		writer.Flush()
+
+		// Wait for the process to complete
+		process.Wait()
 	}
 
-	// Make sure to flush the initial headers
-	writer.Flush()
-
-	// Wait for the process to complete
-	exitCode := process.Wait()
-
 	// Close the writer (no-op if not in markup mode)
-	writer.Close()
+	writer.Close(process.ExitCode)
 
 	// Set the exit code in the trailer
-	w.Header().Set("X-Exit-Code", strconv.Itoa(exitCode))
+	w.Header().Set("X-Exit-Code", strconv.Itoa(process.ExitCode))
 }
 
 // startResponse is a helper function that sets up the response headers and creates the appropriate writer

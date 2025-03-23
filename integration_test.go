@@ -20,6 +20,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -902,10 +903,12 @@ func TestProcessMarkupProtocolIntegration(t *testing.T) {
 	output := string(outputContent)
 
 	// Verify the output structure follows the markup protocol
-	if !strings.Contains(output, "<output>") {
+	startTagRegex := regexp.MustCompile(`<output lines="\d+">`)
+	endTagRegex := regexp.MustCompile(`</output lines="\d+">`)
+	if !startTagRegex.MatchString(output) {
 		t.Errorf("Output does not contain opening <output> tag: %s", output)
 	}
-	if !strings.Contains(output, "</output>") {
+	if !endTagRegex.MatchString(output) {
 		t.Errorf("Output does not contain closing </output> tag: %s", output)
 	}
 	if !strings.Contains(output, "Initial output") {
@@ -931,20 +934,14 @@ func TestProcessMarkupProtocolIntegration(t *testing.T) {
 	}
 
 	// Verify the structure of the markup with a more detailed check
-	segments := strings.Split(output, "</output>")
+	segments := endTagRegex.Split(output, -1)
 	if len(segments) < 2 { // At least one output segment should be closed
 		t.Errorf("Expected at least one closed output segment, found %d segments", len(segments))
 	}
 
 	// Validate the sequence of tags and content
-	hasInitialOutput := false
 	hasKeepalive := false
 	hasAfterKeepalive := false
-
-	// First segment should contain <output>Initial output
-	if len(segments) > 0 && strings.Contains(segments[0], "<output>") && strings.Contains(segments[0], "Initial output") {
-		hasInitialOutput = true
-	}
 
 	// We should find a <keepalive/> followed by <output>After keepalive
 	for i, segment := range segments {
@@ -966,7 +963,7 @@ func TestProcessMarkupProtocolIntegration(t *testing.T) {
 		}
 	}
 
-	if !hasInitialOutput {
+	if !(len(segments) > 0 && strings.Contains(segments[0], "Initial output")) {
 		t.Errorf("Could not find initial output in expected format")
 	}
 
