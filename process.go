@@ -12,134 +12,139 @@ import (
 	"syscall"
 	"text/template"
 	"time"
+
+	"github.com/google/uuid"
 )
 
-// MarkupWriter provides a thread-safe writer with optional markup capabilities
-type MarkupWriter struct {
+// ProcessListener provides a thread-safe writer with optional markup capabilities
+type ProcessListener struct {
+	ID            string
 	Process       *ProcessInfo
-	writer        io.Writer
 	mutex         sync.Mutex
 	markupMode    bool
 	isOutputOpen  bool
 	lastWriteTime time.Time
+	writeChan     chan []byte
 	stopChan      chan struct{}
 }
 
-// NewMarkupWriter creates a new MarkupWriter
-func NewMarkupWriter(w io.Writer, useMarkup bool) *MarkupWriter {
-	mw := &MarkupWriter{
+// NewProcessListener creates a new ProcessListener
+func NewProcessListener(useMarkup bool) *ProcessListener {
+	return &ProcessListener{
+		ID:            uuid.New().String(),
 		Process:       nil,
-		writer:        w,
 		markupMode:    useMarkup,
 		isOutputOpen:  false,
 		lastWriteTime: time.Now(),
+		writeChan:     make(chan []byte, 100),
 		stopChan:      make(chan struct{}),
 	}
-
-	// Start the keepalive goroutine if using markup mode
-	if useMarkup {
-		go mw.keepaliveMonitor()
-	}
-
-	return mw
 }
 
-// Write implements the io.Writer interface with optional markup
-func (w *MarkupWriter) Write(p []byte) (n int, err error) {
+// Forward forwards data to the process listener
+func (w *ProcessListener) Forward(p []byte) bool {
 	w.mutex.Lock()
 	defer w.mutex.Unlock()
 
-	// Update the last write time
-	w.lastWriteTime = time.Now()
+	if w.writeChan == nil {
+		return false
+	}
 
-	w.openSegment()
+	// Make a copy of the data to avoid race conditions
+	dataCopy := make([]byte, len(p))
+	copy(dataCopy, p)
 
-	// Write the actual data
-	n, err = w.writer.Write(p)
-
-	// Flush the output
-	w.Flush()
-
-	return n, err
+	select {
+	case w.writeChan <- dataCopy:
+		return true
+	case <-time.After(100 * time.Millisecond):
+		return true
+	default:
+		return true
+	}
 }
 
-// Flush flushes the underlying writer
-func (w *MarkupWriter) Flush() {
-	if f, ok := w.writer.(http.Flusher); ok {
-		f.Flush()
+// Write implements the io.Writer interface with optional markup
+func (w *ProcessListener) Write(rw http.ResponseWriter) error {
+	for {
+		select {
+		case p := <-w.writeChan:
+			w.openSegment(rw)
+			if _, err := rw.Write(p); err != nil {
+				return err
+			}
+			if f, ok := rw.(http.Flusher); ok {
+				f.Flush()
+			}
+		case <-time.After(10 * time.Second):
+			w.closeSegment(rw)
+			if _, err := rw.Write([]byte("<keepalive/>\n")); err != nil {
+				return err
+			}
+			if f, ok := rw.(http.Flusher); ok {
+				f.Flush()
+			}
+		case <-w.stopChan:
+			return nil
+		}
 	}
 }
 
 // Close closes any open output segment and stops the keepalive monitor if in markup mode
-func (w *MarkupWriter) Close(exitCode int) {
+func (w *ProcessListener) Close(rw http.ResponseWriter, exitCode int) {
 	w.mutex.Lock()
 	defer w.mutex.Unlock()
+
+	// close the write channel
+	if w.writeChan != nil {
+		close(w.writeChan)
+	}
 
 	if !w.markupMode {
 		return
 	}
 
-	// Send the stop signal to the keepalive goroutine
-	close(w.stopChan)
-
 	// Close any open output segment
-	w.closeSegment()
+	w.closeSegment(rw)
 
 	if exitCode != -1 {
-		if _, err := w.writer.Write([]byte("<exitcode>" + strconv.Itoa(exitCode) + "</exitcode>\n")); err != nil {
+		if _, err := rw.Write([]byte("<exitcode>" + strconv.Itoa(exitCode) + "</exitcode>\n")); err != nil {
 			log.Printf("Error writing exitcode: %v", err)
 		}
 	}
 
-	w.Flush()
+	if f, ok := rw.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
-func (w *MarkupWriter) openSegment() {
+func (w *ProcessListener) openSegment(rw http.ResponseWriter) {
 	if w.markupMode && !w.isOutputOpen {
 		infix := ""
 		if w.Process != nil {
+			w.Process.Lock.Lock()
 			infix = " lines=\"" + strconv.Itoa(w.Process.Lines) + "\""
+			w.Process.Lock.Unlock()
 		}
-		if _, err := w.writer.Write([]byte("<output" + infix + ">\n")); err != nil {
+		if _, err := rw.Write([]byte("<output" + infix + ">\n")); err != nil {
 			log.Printf("Error writing opening output tag: %v", err)
 		}
 		w.isOutputOpen = true
 	}
 }
 
-func (w *MarkupWriter) closeSegment() {
+func (w *ProcessListener) closeSegment(rw http.ResponseWriter) {
 	if w.markupMode && w.isOutputOpen {
 		infix := ""
 		if w.Process != nil {
+			w.Process.Lock.Lock()
 			infix = " lines=\"" + strconv.Itoa(w.Process.Lines) + "\""
+			w.Process.Lock.Unlock()
 		}
-		if _, err := w.writer.Write([]byte("</output" + infix + ">\n")); err != nil {
+		if _, err := rw.Write([]byte("</output" + infix + ">\n")); err != nil {
 			log.Printf("Error writing closing output tag: %v", err)
 		}
 		w.isOutputOpen = false
-	}
-}
-
-// keepaliveMonitor runs in a separate goroutine to monitor for inactivity and send keepalives
-func (w *MarkupWriter) keepaliveMonitor() {
-	ticker := time.NewTicker(3 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-w.stopChan:
-			return
-		case <-ticker.C:
-			w.mutex.Lock()
-			if time.Since(w.lastWriteTime) > 15*time.Second {
-				w.closeSegment()
-				if _, err := w.writer.Write([]byte("<keepalive/>\n")); err != nil {
-					log.Printf("Error writing keepalive: %v", err)
-				}
-				w.Flush()
-			}
-			w.mutex.Unlock()
-		}
 	}
 }
 
@@ -152,7 +157,7 @@ type ProcessInfo struct {
 	Cmd       *exec.Cmd // The actual command object
 	ExitCode  int       // The exit code of the process
 	Lines     int
-	Writers   []io.Writer
+	Listeners map[string]*ProcessListener
 	Lock      sync.Mutex // Lock for thread safety
 	Done      *sync.Cond // Cond for thread safety
 }
@@ -169,17 +174,11 @@ func (p *ProcessInfo) Copy(r io.Reader) {
 			break
 		}
 
-		// Write to all attached writers
+		// Write to all attached listeners
 		p.Lock.Lock()
-		for _, writer := range p.Writers {
-			if _, err := writer.Write(buf[:n]); err != nil {
-				log.Printf("Error writing to output: %v", err)
-				continue
-			}
-
-			// Try to flush if it's a MarkupWriter
-			if mw, ok := writer.(*MarkupWriter); ok {
-				mw.Flush()
+		for _, listener := range p.Listeners {
+			if !listener.Forward(buf[:n]) {
+				p.removeListener(listener)
 			}
 		}
 		p.Lines += bytes.Count(buf[:n], []byte("\n"))
@@ -189,6 +188,14 @@ func (p *ProcessInfo) Copy(r io.Reader) {
 
 // Wait blocks until the process is done and returns its exit code
 func (p *ProcessInfo) Wait() int {
+	p.Lock.Lock()
+	exitCode := p.ExitCode
+	p.Lock.Unlock()
+
+	if exitCode != -1 {
+		return exitCode
+	}
+
 	p.Done.L.Lock()
 	defer p.Done.L.Unlock()
 	p.Done.Wait()
@@ -217,7 +224,7 @@ func (r *ProcessRegistry) HasShellTemplate(cmd string) bool {
 }
 
 // AddWriterToProcess adds a writer to a process's Writers list
-func (r *ProcessRegistry) AddWriterToProcess(processID string, writer io.Writer) error {
+func (r *ProcessRegistry) AttachListener(processID string, listener *ProcessListener) error {
 	process, exists := r.GetProcess(processID)
 	if !exists {
 		return fmt.Errorf("process with ID %s not found", processID)
@@ -226,17 +233,24 @@ func (r *ProcessRegistry) AddWriterToProcess(processID string, writer io.Writer)
 	process.Lock.Lock()
 	defer process.Lock.Unlock()
 
-	if mw, ok := writer.(*MarkupWriter); ok {
-		mw.Process = process
-	}
+	listener.Process = process
+	process.Listeners[listener.ID] = listener
 
-	// Add the writer directly without wrapping (the caller is responsible for thread safety)
-	process.Writers = append(process.Writers, writer)
 	return nil
 }
 
-// RegisterProcess adds a process to the registry
-func (r *ProcessRegistry) RegisterProcess(cmd string, command *exec.Cmd, w io.Writer) *ProcessInfo {
+// removeListener removes a listener from a process
+func (p *ProcessInfo) removeListener(listener *ProcessListener) {
+	p.Lock.Lock()
+	defer p.Lock.Unlock()
+	delete(p.Listeners, listener.ID)
+	close(listener.stopChan)
+	close(listener.writeChan)
+	listener.writeChan = nil
+}
+
+// registerProcess adds a process to the registry
+func (r *ProcessRegistry) registerProcess(cmd string, command *exec.Cmd, listener *ProcessListener) *ProcessInfo {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
@@ -251,19 +265,15 @@ func (r *ProcessRegistry) RegisterProcess(cmd string, command *exec.Cmd, w io.Wr
 		Cmd:       command,
 		Lines:     0,
 		ExitCode:  -1,
-		Writers:   make([]io.Writer, 0),
+		Listeners: make(map[string]*ProcessListener),
 		Done:      sync.NewCond(new(sync.Mutex)),
 	}
 	r.processes[processID] = process
 
 	// Add the writer if provided
-	if w != nil {
-		if mw, ok := w.(*MarkupWriter); ok {
-			mw.Process = process
-		}
-
-		// Add the writer directly without wrapping (the caller is responsible for thread safety)
-		process.Writers = append(process.Writers, w)
+	if listener != nil {
+		listener.Process = process
+		process.Listeners[listener.ID] = listener
 	}
 
 	return process
@@ -325,7 +335,7 @@ func (r *ProcessRegistry) TerminateProcess(id string) error {
 }
 
 // Execute runs a command and returns its exit code
-func (r *ProcessRegistry) Execute(cwd string, cmd string, args map[string]interface{}, w io.Writer) (*ProcessInfo, error) {
+func (r *ProcessRegistry) Execute(cwd string, cmd string, args map[string]interface{}, listener *ProcessListener) (*ProcessInfo, error) {
 	shellTmpl, exists := r.shellTemplates[cmd]
 	if !exists {
 		return nil, fmt.Errorf("command not found: %s", cmd)
@@ -360,7 +370,7 @@ func (r *ProcessRegistry) Execute(cwd string, cmd string, args map[string]interf
 	}
 
 	// Register the process
-	processInfo := r.RegisterProcess(cmd, shellcmd, w)
+	processInfo := r.registerProcess(cmd, shellcmd, listener)
 
 	// Start the process
 	if err := shellcmd.Start(); err != nil {
@@ -391,6 +401,10 @@ func (r *ProcessRegistry) Execute(cwd string, cmd string, args map[string]interf
 		processInfo.Done.L.Lock()
 		processInfo.Done.Broadcast()
 		processInfo.Done.L.Unlock()
+
+		for _, listener := range processInfo.Listeners {
+			processInfo.removeListener(listener)
+		}
 	}()
 
 	return processInfo, nil

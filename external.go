@@ -385,13 +385,13 @@ func (workspace *WorkspaceHandler) MakeExecHandler() http.HandlerFunc {
 		}
 
 		// Setup output writer based on followOutput flag
-		var outputWriter io.Writer
+		var outputListener *ProcessListener
 		if followOutput {
-			outputWriter = workspace.startResponse(w, r)
+			outputListener = workspace.startResponse(w, r)
 		}
 
 		// Execute the command
-		process, err := workspace.processRegistry.Execute(workspace.current, cmd, args, outputWriter)
+		process, err := workspace.processRegistry.Execute(workspace.current, cmd, args, outputListener)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -400,18 +400,15 @@ func (workspace *WorkspaceHandler) MakeExecHandler() http.HandlerFunc {
 		// Set Location header pointing to the process endpoint
 		w.Header().Set("Location", fmt.Sprintf("/workspace/process/%s", process.ID))
 
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
-
 		if followOutput {
-			exitCode := process.Wait()
-
-			// If we have a markup writer, close it
-			if markupWriter, ok := outputWriter.(*MarkupWriter); ok {
-				markupWriter.Close(exitCode)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
 			}
 
+			outputListener.Write(w)
+
+			exitCode := process.Wait()
+			outputListener.Close(w, exitCode)
 			w.Header().Set("X-Exit-Code", strconv.Itoa(exitCode))
 		} else {
 			w.WriteHeader(http.StatusAccepted)
@@ -476,31 +473,29 @@ func (workspace *WorkspaceHandler) ProcessTerminateHandler(w http.ResponseWriter
 // ProcessOutputHandler creates an HTTP handler for streaming process output
 func (workspace *WorkspaceHandler) ProcessOutputHandler(w http.ResponseWriter, r *http.Request, process *ProcessInfo) {
 	// Start the response and get the appropriate writer
-	writer := workspace.startResponse(w, r)
+	listener := workspace.startResponse(w, r)
 
 	if process.ExitCode == -1 {
 		// Add the writer to the process's list of writers
-		if err := workspace.processRegistry.AddWriterToProcess(process.ID, writer); err != nil {
+		if err := workspace.processRegistry.AttachListener(process.ID, listener); err != nil {
 			http.Error(w, fmt.Sprintf("Failed to attach to process output: %v", err), http.StatusInternalServerError)
 			return
 		}
-
-		// Make sure to flush the initial headers
-		writer.Flush()
+		listener.Write(w)
 
 		// Wait for the process to complete
 		process.Wait()
 	}
 
 	// Close the writer (no-op if not in markup mode)
-	writer.Close(process.ExitCode)
+	listener.Close(w, process.ExitCode)
 
 	// Set the exit code in the trailer
 	w.Header().Set("X-Exit-Code", strconv.Itoa(process.ExitCode))
 }
 
 // startResponse is a helper function that sets up the response headers and creates the appropriate writer
-func (workspace *WorkspaceHandler) startResponse(w http.ResponseWriter, r *http.Request) *MarkupWriter {
+func (workspace *WorkspaceHandler) startResponse(w http.ResponseWriter, r *http.Request) *ProcessListener {
 	// Check if the client accepts the processml format
 	acceptHeader := r.Header.Get("Accept")
 	useMarkup := strings.Contains(acceptHeader, "application/processml")
@@ -514,7 +509,5 @@ func (workspace *WorkspaceHandler) startResponse(w http.ResponseWriter, r *http.
 	w.Header().Set("Trailer", "X-Exit-Code")
 
 	// Create the writer with markup mode based on the Accept header
-	writer := NewMarkupWriter(w, useMarkup)
-
-	return writer
+	return NewProcessListener(useMarkup)
 }
