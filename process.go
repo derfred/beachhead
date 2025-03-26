@@ -19,43 +19,46 @@ import (
 // ProcessListener provides a thread-safe writer with optional markup capabilities
 type ProcessListener struct {
 	ID            string
-	Process       *ProcessInfo
+	IsClosed      bool
 	mutex         sync.Mutex
 	markupMode    bool
 	isOutputOpen  bool
 	lastWriteTime time.Time
-	writeChan     chan []byte
+	writeChan     chan *ProcessMessage
 	stopChan      chan struct{}
+	lines         int
+}
+
+type ProcessMessage struct {
+	Data  []byte
+	Start int
+	Lines int
 }
 
 // NewProcessListener creates a new ProcessListener
 func NewProcessListener(useMarkup bool) *ProcessListener {
 	return &ProcessListener{
 		ID:            uuid.New().String(),
-		Process:       nil,
+		IsClosed:      false,
 		markupMode:    useMarkup,
 		isOutputOpen:  false,
 		lastWriteTime: time.Now(),
-		writeChan:     make(chan []byte, 100),
+		writeChan:     make(chan *ProcessMessage, 100),
 		stopChan:      make(chan struct{}),
 	}
 }
 
 // Forward forwards data to the process listener
-func (w *ProcessListener) Forward(p []byte) bool {
+func (w *ProcessListener) Forward(p *ProcessMessage) bool {
 	w.mutex.Lock()
 	defer w.mutex.Unlock()
 
-	if w.writeChan == nil {
+	if w.IsClosed {
 		return false
 	}
 
-	// Make a copy of the data to avoid race conditions
-	dataCopy := make([]byte, len(p))
-	copy(dataCopy, p)
-
 	select {
-	case w.writeChan <- dataCopy:
+	case w.writeChan <- p:
 		return true
 	case <-time.After(100 * time.Millisecond):
 		return true
@@ -65,47 +68,64 @@ func (w *ProcessListener) Forward(p []byte) bool {
 }
 
 // Write implements the io.Writer interface with optional markup
-func (w *ProcessListener) Write(rw http.ResponseWriter) error {
+func (l *ProcessListener) Write(rw http.ResponseWriter) error {
 	for {
 		select {
-		case p := <-w.writeChan:
-			w.openSegment(rw)
-			if _, err := rw.Write(p); err != nil {
+		case p := <-l.writeChan:
+			l.lines = p.Start
+			l.openSegment(rw)
+			if _, err := rw.Write(p.Data); err != nil {
 				return err
 			}
+			l.lines += p.Lines
 			if f, ok := rw.(http.Flusher); ok {
 				f.Flush()
 			}
 		case <-time.After(10 * time.Second):
-			w.closeSegment(rw)
+			l.closeSegment(rw)
 			if _, err := rw.Write([]byte("<keepalive/>\n")); err != nil {
 				return err
 			}
 			if f, ok := rw.(http.Flusher); ok {
 				f.Flush()
 			}
-		case <-w.stopChan:
+		case <-l.stopChan:
 			return nil
 		}
 	}
 }
 
-// Close closes any open output segment and stops the keepalive monitor if in markup mode
-func (w *ProcessListener) Close(rw http.ResponseWriter, exitCode int) {
-	w.mutex.Lock()
-	defer w.mutex.Unlock()
+// Shutdown closes the write channel
+func (l *ProcessListener) Shutdown() {
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
 
-	// close the write channel
-	if w.writeChan != nil {
-		close(w.writeChan)
+	if l.IsClosed {
+		return
 	}
 
-	if !w.markupMode {
+	l.IsClosed = true
+	close(l.stopChan)
+	close(l.writeChan)
+}
+
+// Close closes any open output segment and stops the keepalive monitor if in markup mode
+func (l *ProcessListener) Close(rw http.ResponseWriter, exitCode int) {
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
+
+	if l.IsClosed {
+		return
+	}
+
+	l.Shutdown()
+
+	if !l.markupMode {
 		return
 	}
 
 	// Close any open output segment
-	w.closeSegment(rw)
+	l.closeSegment(rw)
 
 	if exitCode != -1 {
 		if _, err := rw.Write([]byte("<exitcode>" + strconv.Itoa(exitCode) + "</exitcode>\n")); err != nil {
@@ -118,48 +138,93 @@ func (w *ProcessListener) Close(rw http.ResponseWriter, exitCode int) {
 	}
 }
 
-func (w *ProcessListener) openSegment(rw http.ResponseWriter) {
-	if w.markupMode && !w.isOutputOpen {
-		infix := ""
-		if w.Process != nil {
-			w.Process.Lock.Lock()
-			infix = " lines=\"" + strconv.Itoa(w.Process.Lines) + "\""
-			w.Process.Lock.Unlock()
-		}
+func (l *ProcessListener) openSegment(rw http.ResponseWriter) {
+	if l.markupMode && !l.isOutputOpen {
+		infix := " lines=\"" + strconv.Itoa(l.lines) + "\""
 		if _, err := rw.Write([]byte("<output" + infix + ">\n")); err != nil {
 			log.Printf("Error writing opening output tag: %v", err)
 		}
-		w.isOutputOpen = true
+		l.isOutputOpen = true
 	}
 }
 
-func (w *ProcessListener) closeSegment(rw http.ResponseWriter) {
-	if w.markupMode && w.isOutputOpen {
-		infix := ""
-		if w.Process != nil {
-			w.Process.Lock.Lock()
-			infix = " lines=\"" + strconv.Itoa(w.Process.Lines) + "\""
-			w.Process.Lock.Unlock()
-		}
+func (l *ProcessListener) closeSegment(rw http.ResponseWriter) {
+	if l.markupMode && l.isOutputOpen {
+		infix := " lines=\"" + strconv.Itoa(l.lines) + "\""
 		if _, err := rw.Write([]byte("</output" + infix + ">\n")); err != nil {
 			log.Printf("Error writing closing output tag: %v", err)
 		}
-		w.isOutputOpen = false
+		l.isOutputOpen = false
 	}
+}
+
+// ProcessExit struct should use the same mutex for condition variable
+type ProcessExit struct {
+	ExitCode int
+	mu       sync.Mutex
+	cond     *sync.Cond
+}
+
+func NewProcessExit() *ProcessExit {
+	pe := &ProcessExit{
+		ExitCode: -1,
+		mu:       sync.Mutex{},
+	}
+	pe.cond = sync.NewCond(&pe.mu) // Use the same mutex for the condition variable
+	return pe
+}
+
+func (p *ProcessExit) Set(code int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.ExitCode = code
+	p.cond.Broadcast()
+}
+
+func (p *ProcessExit) Get() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.ExitCode
+}
+
+func (p *ProcessExit) IsSet() bool {
+	return p.Get() != -1
+}
+
+func (p *ProcessExit) Wait() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.ExitCode != -1 {
+		return p.ExitCode
+	}
+
+	p.cond.Wait()
+	return p.ExitCode
 }
 
 // ProcessInfo represents information about a running process
 type ProcessInfo struct {
-	ID        string    // Unique identifier for the process
-	Command   string    // The command that was executed
-	PID       int       // Process ID
-	StartTime time.Time // When the process was started
-	Cmd       *exec.Cmd // The actual command object
-	ExitCode  int       // The exit code of the process
+	ID        string       // Unique identifier for the process
+	Command   string       // The command that was executed
+	PID       int          // Process ID
+	StartTime time.Time    // When the process was started
+	Cmd       *exec.Cmd    // The actual command object
+	Exit      *ProcessExit // The exit code of the process
 	Lines     int
 	Listeners map[string]*ProcessListener
 	Lock      sync.Mutex // Lock for thread safety
 	Done      *sync.Cond // Cond for thread safety
+}
+
+func (p *ProcessInfo) copyMessage(data []byte) *ProcessMessage {
+	dataCopy := make([]byte, len(data))
+	copy(dataCopy, data)
+	return &ProcessMessage{
+		Data:  dataCopy,
+		Start: p.Lines,
+		Lines: bytes.Count(data, []byte("\n")),
+	}
 }
 
 func (p *ProcessInfo) Copy(r io.Reader) {
@@ -177,9 +242,7 @@ func (p *ProcessInfo) Copy(r io.Reader) {
 		// Write to all attached listeners
 		p.Lock.Lock()
 		for _, listener := range p.Listeners {
-			if !listener.Forward(buf[:n]) {
-				p.removeListener(listener)
-			}
+			listener.Forward(p.copyMessage(buf[:n]))
 		}
 		p.Lines += bytes.Count(buf[:n], []byte("\n"))
 		p.Lock.Unlock()
@@ -189,17 +252,17 @@ func (p *ProcessInfo) Copy(r io.Reader) {
 // Wait blocks until the process is done and returns its exit code
 func (p *ProcessInfo) Wait() int {
 	p.Lock.Lock()
-	exitCode := p.ExitCode
+	exit := p.Exit
 	p.Lock.Unlock()
+	return exit.Wait()
+}
 
-	if exitCode != -1 {
-		return exitCode
-	}
-
-	p.Done.L.Lock()
-	defer p.Done.L.Unlock()
-	p.Done.Wait()
-	return p.ExitCode
+// removeListener removes a listener from a process
+func (p *ProcessInfo) RemoveListener(listener *ProcessListener) {
+	p.Lock.Lock()
+	defer p.Lock.Unlock()
+	delete(p.Listeners, listener.ID)
+	listener.Shutdown()
 }
 
 // ProcessRegistry manages running processes
@@ -233,20 +296,9 @@ func (r *ProcessRegistry) AttachListener(processID string, listener *ProcessList
 	process.Lock.Lock()
 	defer process.Lock.Unlock()
 
-	listener.Process = process
 	process.Listeners[listener.ID] = listener
 
 	return nil
-}
-
-// removeListener removes a listener from a process
-func (p *ProcessInfo) removeListener(listener *ProcessListener) {
-	p.Lock.Lock()
-	defer p.Lock.Unlock()
-	delete(p.Listeners, listener.ID)
-	close(listener.stopChan)
-	close(listener.writeChan)
-	listener.writeChan = nil
 }
 
 // registerProcess adds a process to the registry
@@ -264,15 +316,13 @@ func (r *ProcessRegistry) registerProcess(cmd string, command *exec.Cmd, listene
 		StartTime: time.Now(),
 		Cmd:       command,
 		Lines:     0,
-		ExitCode:  -1,
+		Exit:      NewProcessExit(),
 		Listeners: make(map[string]*ProcessListener),
-		Done:      sync.NewCond(new(sync.Mutex)),
 	}
 	r.processes[processID] = process
 
 	// Add the writer if provided
 	if listener != nil {
-		listener.Process = process
 		process.Listeners[listener.ID] = listener
 	}
 
@@ -328,8 +378,6 @@ func (r *ProcessRegistry) TerminateProcess(id string) error {
 			return fmt.Errorf("failed to kill process: %v", killErr)
 		}
 	}
-
-	process.Cmd.Wait()
 
 	return nil
 }
@@ -389,21 +437,15 @@ func (r *ProcessRegistry) Execute(cwd string, cmd string, args map[string]interf
 		if err != nil {
 			if exitErr, ok := err.(*exec.ExitError); ok {
 				exitCode = exitErr.ExitCode()
-				processInfo.Lock.Lock()
-				processInfo.ExitCode = exitCode
-				processInfo.Lock.Unlock()
 			}
-		} else {
-			processInfo.Lock.Lock()
-			processInfo.ExitCode = 0
-			processInfo.Lock.Unlock()
 		}
-		processInfo.Done.L.Lock()
-		processInfo.Done.Broadcast()
-		processInfo.Done.L.Unlock()
 
+		processInfo.Exit.Set(exitCode)
+
+		processInfo.Lock.Lock()
+		defer processInfo.Lock.Unlock()
 		for _, listener := range processInfo.Listeners {
-			processInfo.removeListener(listener)
+			listener.Shutdown()
 		}
 	}()
 

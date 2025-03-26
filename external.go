@@ -401,6 +401,7 @@ func (workspace *WorkspaceHandler) MakeExecHandler() http.HandlerFunc {
 		w.Header().Set("Location", fmt.Sprintf("/workspace/process/%s", process.ID))
 
 		if followOutput {
+			defer process.RemoveListener(outputListener)
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}
@@ -442,7 +443,7 @@ func (workspace *WorkspaceHandler) ProcessDetailsHandler(w http.ResponseWriter, 
 		"pid":          process.PID,
 		"start_time":   process.StartTime,
 		"running_time": time.Since(process.StartTime).String(),
-		"exit_code":    process.ExitCode,
+		"exit_code":    process.Exit.Get(),
 	}
 	process.Lock.Unlock()
 
@@ -474,8 +475,9 @@ func (workspace *WorkspaceHandler) ProcessTerminateHandler(w http.ResponseWriter
 func (workspace *WorkspaceHandler) ProcessOutputHandler(w http.ResponseWriter, r *http.Request, process *ProcessInfo) {
 	// Start the response and get the appropriate writer
 	listener := workspace.startResponse(w, r)
+	defer process.RemoveListener(listener)
 
-	if process.ExitCode == -1 {
+	if !process.Exit.IsSet() {
 		// Add the writer to the process's list of writers
 		if err := workspace.processRegistry.AttachListener(process.ID, listener); err != nil {
 			http.Error(w, fmt.Sprintf("Failed to attach to process output: %v", err), http.StatusInternalServerError)
@@ -488,10 +490,10 @@ func (workspace *WorkspaceHandler) ProcessOutputHandler(w http.ResponseWriter, r
 	}
 
 	// Close the writer (no-op if not in markup mode)
-	listener.Close(w, process.ExitCode)
+	listener.Close(w, process.Exit.Wait())
 
 	// Set the exit code in the trailer
-	w.Header().Set("X-Exit-Code", strconv.Itoa(process.ExitCode))
+	w.Header().Set("X-Exit-Code", strconv.Itoa(process.Exit.Wait()))
 }
 
 // startResponse is a helper function that sets up the response headers and creates the appropriate writer
