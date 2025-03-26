@@ -406,7 +406,11 @@ func (workspace *WorkspaceHandler) MakeExecHandler() http.HandlerFunc {
 				f.Flush()
 			}
 
-			outputListener.Write(w)
+			err := outputListener.Write(w)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
 
 			exitCode := process.Wait()
 			outputListener.Close(w, exitCode)
@@ -483,7 +487,11 @@ func (workspace *WorkspaceHandler) ProcessOutputHandler(w http.ResponseWriter, r
 			http.Error(w, fmt.Sprintf("Failed to attach to process output: %v", err), http.StatusInternalServerError)
 			return
 		}
-		listener.Write(w)
+		err := listener.Write(w)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 
 		// Wait for the process to complete
 		process.Wait()

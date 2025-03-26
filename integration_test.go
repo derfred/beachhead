@@ -1077,5 +1077,8 @@ func testProcessOutputWithMarkup(t *testing.T, server *Server, certPool *x509.Ce
 	req.Header.Set("Authorization", "Bearer test-token")
 
 	// Ignore errors on termination - the process might have finished already due to the timeout
-	client.Do(req)
+	_, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to terminate process: %v", err)
+	}
 }
