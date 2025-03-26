@@ -379,6 +379,8 @@ func (r *ProcessRegistry) TerminateProcess(id string) error {
 		}
 	}
 
+	process.Exit.Wait()
+
 	return nil
 }
 

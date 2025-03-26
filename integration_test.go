@@ -22,7 +22,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -561,7 +560,7 @@ func TestProcessTerminationIntegration(t *testing.T) {
 		t.Fatalf("Failed to marshal JSON: %v", err)
 	}
 
-	execURL := fmt.Sprintf("https://localhost:%d/workspace/exec/sleep", server.GetExternalPort())
+	execURL := fmt.Sprintf("https://localhost:%d/workspace/exec/sleep?follow=false", server.GetExternalPort())
 	req, err := http.NewRequest(http.MethodPost, execURL, bytes.NewBuffer(reqBody))
 	if err != nil {
 		t.Fatalf("Failed to create request: %v", err)
@@ -569,34 +568,15 @@ func TestProcessTerminationIntegration(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer test-token")
 
-	// Create a channel to capture any errors from the background goroutine
-	errCh := make(chan string, 1)
-
-	// Use a mutex to protect access to shared variables
-	var errMutex sync.Mutex
-
-	// Execute the sleep command in the background
-	go func() {
-		_, err := client.Do(req)
-		if err != nil && !strings.Contains(err.Error(), "EOF") && !strings.Contains(err.Error(), "connection closed") {
-			errMutex.Lock()
-			errCh <- fmt.Sprintf("Sleep command execution error (may be expected if terminated): %v", err)
-			errMutex.Unlock()
-		}
-	}()
-
-	// Wait a bit for the process to start
-	time.Sleep(2 * time.Second)
-
-	// Check for any errors from the goroutine (non-blocking)
-	errMutex.Lock()
-	select {
-	case errMsg := <-errCh:
-		t.Logf("%s", errMsg)
-	default:
-		// No error, continue
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to execute command: %v", err)
 	}
-	errMutex.Unlock()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("Expected status 202 for processes, got %d", resp.StatusCode)
+	}
 
 	// Get list of processes
 	processesURL := fmt.Sprintf("https://localhost:%d/workspace/processes", server.GetExternalPort())
@@ -606,7 +586,7 @@ func TestProcessTerminationIntegration(t *testing.T) {
 	}
 	req.Header.Set("Authorization", "Bearer test-token")
 
-	resp, err := client.Do(req)
+	resp, err = client.Do(req)
 	if err != nil {
 		t.Fatalf("Failed to get processes: %v", err)
 	}
