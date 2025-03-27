@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-var version = "0.3"
+var version = "0.4"
 
 // HealthHandler responds with 200 OK.
 func HealthHandler(w http.ResponseWriter, r *http.Request) {
