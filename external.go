@@ -39,10 +39,11 @@ type WorkspaceHandler struct {
 	processRegistry *ProcessRegistry
 }
 
-func NewWorkspaceHandler(workspaceBase string, shellTemplates map[string]ShellTemplate) *WorkspaceHandler {
+func NewWorkspaceHandler(cfg config) *WorkspaceHandler {
 	return &WorkspaceHandler{
-		base:            workspaceBase,
-		processRegistry: NewProcessRegistry(shellTemplates),
+		base:            cfg.Workspace,
+		current:         cfg.InitialWorkspace,
+		processRegistry: NewProcessRegistry(cfg.ShellTemplates),
 	}
 }
 

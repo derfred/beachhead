@@ -25,21 +25,22 @@ type PathProxyRule struct {
 }
 
 type config struct {
-	internalPort   int
-	externalPort   int
-	useHttp        bool
-	authToken      string
-	endpoint       string
-	upstream       string
-	mode           string
-	skipVerify     bool
-	certFile       string
-	keyFile        string
-	caFile         string
-	shellFlags     []string
-	ShellTemplates map[string]ShellTemplate
-	Workspace      string
-	PathProxies    []PathProxyRule // List of path-based proxy rules
+	internalPort     int
+	externalPort     int
+	useHttp          bool
+	authToken        string
+	endpoint         string
+	upstream         string
+	mode             string
+	skipVerify       bool
+	certFile         string
+	keyFile          string
+	caFile           string
+	shellFlags       []string
+	ShellTemplates   map[string]ShellTemplate
+	Workspace        string
+	InitialWorkspace string
+	PathProxies      []PathProxyRule // List of path-based proxy rules
 }
 
 func (c config) makeTlsconfig() (*tls.Config, error) {
@@ -87,6 +88,8 @@ func setupServerFlags(fs *flag.FlagSet, cfg *config) {
 		"Authorization token (env: AUTH_TOKEN)")
 	fs.StringVar(&cfg.Workspace, "workspace", os.Getenv("WORKSPACE"),
 		"Base workspace directory (env: WORKSPACE)")
+	fs.StringVar(&cfg.InitialWorkspace, "initial-workspace", os.Getenv("INITIAL_WORKSPACE"),
+		"Initial workspace directory (env: INITIAL_WORKSPACE)")
 
 	fs.Func("shell", "Define shell command template in format name[@user]:template", func(s string) error {
 		cfg.shellFlags = append(cfg.shellFlags, s)

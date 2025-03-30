@@ -43,7 +43,7 @@ func authenticate(authToken string, next http.Handler) http.Handler {
 func NewServer(cfg config) *Server {
 	result := Server{
 		proxy:       NewProxy(),
-		workspace:   NewWorkspaceHandler(cfg.Workspace, cfg.ShellTemplates),
+		workspace:   NewWorkspaceHandler(cfg),
 		pathProxies: cfg.PathProxies,
 	}
 
