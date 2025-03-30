@@ -17,6 +17,13 @@ type ShellTemplate struct {
 	Template string
 }
 
+// PathProxyRule defines a rule for proxying requests from a path to a local port
+type PathProxyRule struct {
+	Path         string // The path to match (e.g. "/jupyter")
+	Port         int    // The local port to proxy to
+	UpstreamPath string // The path to use on the upstream server (e.g. "/" or "/api")
+}
+
 type config struct {
 	internalPort   int
 	externalPort   int
@@ -32,6 +39,7 @@ type config struct {
 	shellFlags     []string
 	ShellTemplates map[string]ShellTemplate
 	Workspace      string
+	PathProxies    []PathProxyRule // List of path-based proxy rules
 }
 
 func (c config) makeTlsconfig() (*tls.Config, error) {
@@ -84,6 +92,35 @@ func setupServerFlags(fs *flag.FlagSet, cfg *config) {
 		cfg.shellFlags = append(cfg.shellFlags, s)
 		return nil
 	})
+
+	fs.Func("path-proxy", "Define path proxy rule in format path:port:upstream_path (e.g. /jupyter:8000:/)", func(s string) error {
+		parts := strings.Split(s, ":")
+		if len(parts) != 3 {
+			return fmt.Errorf("invalid path proxy format. Use path:port:upstream_path")
+		}
+
+		path := parts[0]
+		if !strings.HasPrefix(path, "/") {
+			path = "/" + path
+		}
+
+		port, err := strconv.Atoi(parts[1])
+		if err != nil {
+			return fmt.Errorf("invalid port number: %v", err)
+		}
+
+		upstreamPath := parts[2]
+		if !strings.HasPrefix(upstreamPath, "/") {
+			upstreamPath = "/" + upstreamPath
+		}
+
+		cfg.PathProxies = append(cfg.PathProxies, PathProxyRule{
+			Path:         path,
+			Port:         port,
+			UpstreamPath: upstreamPath,
+		})
+		return nil
+	})
 }
 
 // new helper to parse a shell flag of form "name[@user]:template"
@@ -127,6 +164,49 @@ func processShellEnv() map[string]ShellTemplate {
 		}
 	}
 	return templates
+}
+
+// new helper to process env vars starting with BEACHHEAD_PATH_PROXY_
+func processPathProxyEnv() []PathProxyRule {
+	var rules []PathProxyRule
+	for _, env := range os.Environ() {
+		if strings.HasPrefix(env, "BEACHHEAD_PATH_PROXY_") {
+			kv := strings.SplitN(env, "=", 2)
+			if len(kv) != 2 {
+				continue
+			}
+			val := kv[1]
+			// For env var, format is path:port:upstream_path
+			parts := strings.Split(val, ":")
+			if len(parts) != 3 {
+				log.Printf("Invalid path proxy format in env var: %s", env)
+				continue
+			}
+
+			path := parts[0]
+			if !strings.HasPrefix(path, "/") {
+				path = "/" + path
+			}
+
+			port, err := strconv.Atoi(parts[1])
+			if err != nil {
+				log.Printf("Invalid port number in env var: %s", env)
+				continue
+			}
+
+			upstreamPath := parts[2]
+			if !strings.HasPrefix(upstreamPath, "/") {
+				upstreamPath = "/" + upstreamPath
+			}
+
+			rules = append(rules, PathProxyRule{
+				Path:         path,
+				Port:         port,
+				UpstreamPath: upstreamPath,
+			})
+		}
+	}
+	return rules
 }
 
 // Process shell flags and env vars after flag parsing.
@@ -178,6 +258,8 @@ func loadConfig() config {
 			log.Fatal("Authorization token not set")
 		}
 		processShellTemplates(&cfg)
+		// Process path proxy environment variables
+		cfg.PathProxies = append(cfg.PathProxies, processPathProxyEnv()...)
 
 	case "client":
 		clientCmd := flag.NewFlagSet("client", flag.ExitOnError)

@@ -17,6 +17,7 @@ type Server struct {
 	externalServer      *http.Server
 	proxy               *Proxy
 	workspace           *WorkspaceHandler
+	pathProxies         []PathProxyRule
 }
 
 func authenticate(authToken string, next http.Handler) http.Handler {
@@ -41,8 +42,9 @@ func authenticate(authToken string, next http.Handler) http.Handler {
 
 func NewServer(cfg config) *Server {
 	result := Server{
-		proxy:     NewProxy(),
-		workspace: NewWorkspaceHandler(cfg.Workspace, cfg.ShellTemplates),
+		proxy:       NewProxy(),
+		workspace:   NewWorkspaceHandler(cfg.Workspace, cfg.ShellTemplates),
+		pathProxies: cfg.PathProxies,
 	}
 
 	// Generate self-signed cert if not provided via env vars.
@@ -115,6 +117,12 @@ func NewServer(cfg config) *Server {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		}
 	})))
+
+	// Add path proxy handlers
+	if len(cfg.PathProxies) > 0 {
+		pathProxyHandler := NewPathProxyHandler(cfg.PathProxies)
+		extMux.Handle("/", authenticate(cfg.authToken, pathProxyHandler))
+	}
 
 	result.externalServer = &http.Server{
 		Handler: extMux,

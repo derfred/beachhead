@@ -21,9 +21,12 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 // GenerateTestCert creates a self-signed certificate for testing purposes.
@@ -72,7 +75,7 @@ func GenerateTestCert(host string) (*x509.Certificate, any, error) {
 	return cert, privKey, nil
 }
 
-func buildServer(t *testing.T, cmds map[string]ShellTemplate) (*Server, *x509.CertPool, func()) {
+func buildServer(t *testing.T, cmds map[string]ShellTemplate, pathProxies []PathProxyRule) (*Server, *x509.CertPool, func()) {
 	// Generate test certificates
 	cert, privKey, err := GenerateTestCert("localhost")
 	if err != nil {
@@ -121,6 +124,7 @@ func buildServer(t *testing.T, cmds map[string]ShellTemplate) (*Server, *x509.Ce
 		certFile:       certFile.Name(),
 		keyFile:        keyFile.Name(),
 		ShellTemplates: cmds,
+		PathProxies:    pathProxies,
 	}
 	server := NewServer(cfg)
 	cleanup := func() {
@@ -141,7 +145,7 @@ func TestIntegrationWithCertificates(t *testing.T) {
 	}))
 	defer upstreamServer.Close()
 
-	server, certPool, cleanup := buildServer(t, nil)
+	server, certPool, cleanup := buildServer(t, nil, nil)
 	go server.Start()
 	defer cleanup()
 
@@ -190,7 +194,7 @@ func TestIntegrationWithCertificates(t *testing.T) {
 }
 
 func TestUploadDownloadIntegration(t *testing.T) {
-	server, certPool, cleanup := buildServer(t, nil)
+	server, certPool, cleanup := buildServer(t, nil, nil)
 	go server.Start()
 	defer cleanup()
 	time.Sleep(1 * time.Second)
@@ -268,7 +272,7 @@ func TestUploadDownloadIntegration(t *testing.T) {
 func TestExecIntegration(t *testing.T) {
 	server, certPool, cleanup := buildServer(t, map[string]ShellTemplate{
 		"echo": {Template: "echo {{.args}}"},
-	})
+	}, nil)
 	go server.Start()
 	defer server.Shutdown()
 	defer cleanup()
@@ -336,7 +340,7 @@ func TestExecWithFilesIntegration(t *testing.T) {
 	// Generate test certificates and start server
 	server, certPool, cleanup := buildServer(t, map[string]ShellTemplate{
 		"cat": {Template: "cat {{.input}}"},
-	})
+	}, nil)
 
 	go server.Start()
 	defer cleanup()
@@ -431,7 +435,7 @@ func TestExecWithFilesIntegration(t *testing.T) {
 }
 
 func TestWorkspaceIntegration(t *testing.T) {
-	server, certPool, cleanup := buildServer(t, nil)
+	server, certPool, cleanup := buildServer(t, nil, nil)
 	go server.Start()
 	defer cleanup()
 	time.Sleep(1 * time.Second)
@@ -532,7 +536,7 @@ func TestProcessTerminationIntegration(t *testing.T) {
 	// Start a server with a sleep command template
 	server, certPool, cleanup := buildServer(t, map[string]ShellTemplate{
 		"sleep": {Template: "sleep {{.duration}}"},
-	})
+	}, nil)
 	go server.Start()
 	defer cleanup()
 	time.Sleep(1 * time.Second)
@@ -724,7 +728,7 @@ func TestProcessOutputFollowIntegration(t *testing.T) {
 	// Start a server with echo command template
 	server, certPool, cleanup := buildServer(t, map[string]ShellTemplate{
 		"echo": {Template: "echo '{{.message}}' && sleep 1 && echo '{{.message2}}'"},
-	})
+	}, nil)
 	go server.Start()
 	defer cleanup()
 	time.Sleep(1 * time.Second)
@@ -828,7 +832,7 @@ func TestProcessMarkupProtocolIntegration(t *testing.T) {
 	// Start a server with a command template that includes delays to trigger keepalives
 	server, certPool, cleanup := buildServer(t, map[string]ShellTemplate{
 		"test_markup": {Template: "echo 'Initial output' && sleep 20 && echo 'After keepalive' && sleep 16 && echo 'Final output'"},
-	})
+	}, nil)
 	go server.Start()
 	defer cleanup()
 	time.Sleep(1 * time.Second)
@@ -1081,4 +1085,229 @@ func testProcessOutputWithMarkup(t *testing.T, server *Server, certPool *x509.Ce
 	if err != nil {
 		t.Fatalf("Failed to terminate process: %v", err)
 	}
+}
+
+// TestPathProxyIntegration tests the path proxy functionality
+func TestPathProxyIntegration(t *testing.T) {
+	// Create WebSocket upgrader
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			return true // Allow all origins in tests
+		},
+	}
+
+	// Start upstream servers for different paths
+	jupyterServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Verify the path is correctly transformed
+		expectedPath := "/notebooks/123"
+		actualPath := r.URL.Path
+		// Normalize paths by removing any double slashes
+		actualPath = strings.ReplaceAll(actualPath, "//", "/")
+		if actualPath != expectedPath {
+			t.Errorf("Expected path %s, got %s", expectedPath, actualPath)
+		}
+		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write([]byte("Jupyter response")); err != nil {
+			t.Errorf("Failed to write response: %v", err)
+		}
+	}))
+	defer jupyterServer.Close()
+
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Verify the path is correctly transformed
+		expectedPath := "/api/users/456"
+		actualPath := r.URL.Path
+		// Normalize paths by removing any double slashes
+		actualPath = strings.ReplaceAll(actualPath, "//", "/")
+		if actualPath != expectedPath {
+			t.Errorf("Expected path %s, got %s", expectedPath, actualPath)
+		}
+		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write([]byte("API response")); err != nil {
+			t.Errorf("Failed to write response: %v", err)
+		}
+	}))
+	defer apiServer.Close()
+
+	// Start WebSocket server
+	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Verify the path is correctly transformed
+		expectedPath := "/ws/echo"
+		actualPath := r.URL.Path
+		// Normalize paths by removing any double slashes
+		actualPath = strings.ReplaceAll(actualPath, "//", "/")
+		if actualPath != expectedPath {
+			t.Errorf("Expected path %s, got %s", expectedPath, actualPath)
+		}
+
+		// Upgrade the connection to WebSocket
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("Failed to upgrade connection: %v", err)
+			return
+		}
+		defer conn.Close()
+
+		// Echo messages back to the client
+		for {
+			messageType, message, err := conn.ReadMessage()
+			if err != nil {
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+					t.Errorf("WebSocket read error: %v", err)
+				}
+				break
+			}
+
+			if err := conn.WriteMessage(messageType, message); err != nil {
+				t.Errorf("WebSocket write error: %v", err)
+				break
+			}
+		}
+	}))
+	defer wsServer.Close()
+
+	// Extract ports from the test servers
+	jupyterPort := strings.TrimPrefix(jupyterServer.URL, "http://127.0.0.1:")
+	apiPort := strings.TrimPrefix(apiServer.URL, "http://127.0.0.1:")
+	wsPort := strings.TrimPrefix(wsServer.URL, "http://127.0.0.1:")
+
+	// Start the main server with path proxy rules
+	pathProxies := []PathProxyRule{
+		{Path: "/jupyter", Port: mustParseInt(jupyterPort), UpstreamPath: "/"},
+		{Path: "/api", Port: mustParseInt(apiPort), UpstreamPath: "/api"},
+		{Path: "/ws", Port: mustParseInt(wsPort), UpstreamPath: "/ws"},
+	}
+	server, certPool, cleanup := buildServer(t, nil, pathProxies)
+
+	go server.Start()
+	defer cleanup()
+	time.Sleep(1 * time.Second)
+
+	// Create HTTP client with TLS config
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{RootCAs: certPool},
+		},
+	}
+
+	// Test Jupyter proxy
+	jupyterURL := fmt.Sprintf("https://localhost:%d/jupyter/notebooks/123", server.GetExternalPort())
+	req, err := http.NewRequest(http.MethodGet, jupyterURL, nil)
+	if err != nil {
+		t.Fatalf("Failed to create Jupyter request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to make Jupyter request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Expected status 200 for Jupyter request, got %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("Failed to read Jupyter response: %v", err)
+	}
+
+	if string(body) != "Jupyter response" {
+		t.Fatalf("Unexpected Jupyter response: %s", string(body))
+	}
+
+	// Test API proxy
+	apiURL := fmt.Sprintf("https://localhost:%d/api/users/456", server.GetExternalPort())
+	req, err = http.NewRequest(http.MethodGet, apiURL, nil)
+	if err != nil {
+		t.Fatalf("Failed to create API request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to make API request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Expected status 200 for API request, got %d", resp.StatusCode)
+	}
+
+	body, err = io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("Failed to read API response: %v", err)
+	}
+
+	if string(body) != "API response" {
+		t.Fatalf("Unexpected API response: %s", string(body))
+	}
+
+	// Test WebSocket proxy
+	wsURL := fmt.Sprintf("wss://localhost:%d/ws/echo", server.GetExternalPort())
+	dialer := websocket.Dialer{
+		TLSClientConfig: &tls.Config{RootCAs: certPool},
+	}
+
+	// Add authorization header
+	header := http.Header{}
+	header.Set("Authorization", "Bearer test-token")
+
+	// Connect to the WebSocket server
+	wsConn, _, err := dialer.Dial(wsURL, header)
+	if err != nil {
+		t.Fatalf("Failed to connect to WebSocket server: %v", err)
+	}
+	defer wsConn.Close()
+
+	// Send a test message
+	testMessage := "Hello WebSocket!"
+	err = wsConn.WriteMessage(websocket.TextMessage, []byte(testMessage))
+	if err != nil {
+		t.Fatalf("Failed to write WebSocket message: %v", err)
+	}
+
+	// Read the echoed message
+	_, message, err := wsConn.ReadMessage()
+	if err != nil {
+		t.Fatalf("Failed to read WebSocket message: %v", err)
+	}
+
+	if string(message) != testMessage {
+		t.Fatalf("Unexpected WebSocket response: got %s, want %s", string(message), testMessage)
+	}
+
+	// Send a close message
+	err = wsConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+	if err != nil {
+		t.Fatalf("Failed to send close message: %v", err)
+	}
+
+	// Test non-matching path
+	unknownURL := fmt.Sprintf("https://localhost:%d/unknown/path", server.GetExternalPort())
+	req, err = http.NewRequest(http.MethodGet, unknownURL, nil)
+	if err != nil {
+		t.Fatalf("Failed to create unknown path request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to make unknown path request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("Expected status 404 for unknown path, got %d", resp.StatusCode)
+	}
+}
+
+// Helper function to parse port string to int
+func mustParseInt(s string) int {
+	i, err := strconv.Atoi(s)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to parse port %s: %v", s, err))
+	}
+	return i
 }
