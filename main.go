@@ -93,7 +93,7 @@ func setupServerFlags(fs *flag.FlagSet, cfg *config) {
 		return nil
 	})
 
-	fs.Func("path-proxy", "Define path proxy rule in format path:port:upstream_path (e.g. /jupyter:8000:/)", func(s string) error {
+	fs.Func("proxy", "Define proxy rule in format path:port:upstream_path (e.g. /jupyter:8000:/)", func(s string) error {
 		parts := strings.Split(s, ":")
 		if len(parts) != 3 {
 			return fmt.Errorf("invalid path proxy format. Use path:port:upstream_path")
@@ -170,7 +170,7 @@ func processShellEnv() map[string]ShellTemplate {
 func processPathProxyEnv() []PathProxyRule {
 	var rules []PathProxyRule
 	for _, env := range os.Environ() {
-		if strings.HasPrefix(env, "BEACHHEAD_PATH_PROXY_") {
+		if strings.HasPrefix(env, "BEACHHEAD_PROXY_") {
 			kv := strings.SplitN(env, "=", 2)
 			if len(kv) != 2 {
 				continue
