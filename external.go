@@ -353,6 +353,20 @@ func (workspace *WorkspaceHandler) MakeWorkspaceDownloadHandler() http.HandlerFu
 	}
 }
 
+func boolParam(r *http.Request, name string, defaultValue bool) bool {
+	value := r.URL.Query().Get(name)
+	if value == "" {
+		return defaultValue
+	}
+	if value == "false" || value == "0" {
+		return false
+	}
+	if value == "true" || value == "1" {
+		return true
+	}
+	return defaultValue
+}
+
 // MakeExecHandler creates an HTTP handler for executing commands
 func (workspace *WorkspaceHandler) MakeExecHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -383,14 +397,8 @@ func (workspace *WorkspaceHandler) MakeExecHandler() http.HandlerFunc {
 			return
 		}
 
-		// Get follow parameter from query string instead of request body
-		followOutput := true
-		followParam := r.URL.Query().Get("follow")
-		if followParam != "" {
-			followOutput = followParam != "false" && followParam != "0"
-		}
-
 		// Setup output writer based on followOutput flag
+		followOutput := boolParam(r, "follow", true)
 		var outputListener *ProcessListener
 		if followOutput {
 			outputListener = workspace.startResponse(w, r)
@@ -488,7 +496,8 @@ func (workspace *WorkspaceHandler) ProcessOutputHandler(w http.ResponseWriter, r
 
 	if !process.Exit.IsSet() {
 		// Add the writer to the process's list of writers
-		if err := workspace.processRegistry.AttachListener(process.ID, listener); err != nil {
+		catchup := boolParam(r, "catchup", true)
+		if err := workspace.processRegistry.AttachListener(process.ID, listener, catchup); err != nil {
 			http.Error(w, fmt.Sprintf("Failed to attach to process output: %v", err), http.StatusInternalServerError)
 			return
 		}

@@ -308,7 +308,7 @@ func (r *ProcessRegistry) HasShellTemplate(cmd string) bool {
 }
 
 // AddWriterToProcess adds a writer to a process's Writers list
-func (r *ProcessRegistry) AttachListener(processID string, listener *ProcessListener) error {
+func (r *ProcessRegistry) AttachListener(processID string, listener *ProcessListener, catchup bool) error {
 	process, exists := r.GetProcess(processID)
 	if !exists {
 		return fmt.Errorf("process with ID %s not found", processID)
@@ -318,7 +318,7 @@ func (r *ProcessRegistry) AttachListener(processID string, listener *ProcessList
 	defer process.Lock.Unlock()
 
 	// If we have previous output lines, send them first
-	if process.lastOutputLines != nil {
+	if process.lastOutputLines != nil && catchup {
 		var contextLines [][]byte
 		// Collect the last 5 lines in correct order
 		for i := 0; i < 5; i++ {
