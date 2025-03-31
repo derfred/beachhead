@@ -40,11 +40,16 @@ type WorkspaceHandler struct {
 }
 
 func NewWorkspaceHandler(cfg config) *WorkspaceHandler {
-	return &WorkspaceHandler{
+	result := &WorkspaceHandler{
 		base:            cfg.Workspace,
-		current:         cfg.InitialWorkspace,
 		processRegistry: NewProcessRegistry(cfg.ShellTemplates),
 	}
+
+	if cfg.InitialWorkspace != "" {
+		result.current = filepath.Join(cfg.Workspace, cfg.InitialWorkspace)
+	}
+
+	return result
 }
 
 type ExecRequest struct {
