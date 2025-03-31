@@ -205,16 +205,18 @@ func (p *ProcessExit) Wait() int {
 
 // ProcessInfo represents information about a running process
 type ProcessInfo struct {
-	ID        string       // Unique identifier for the process
-	Command   string       // The command that was executed
-	PID       int          // Process ID
-	StartTime time.Time    // When the process was started
-	Cmd       *exec.Cmd    // The actual command object
-	Exit      *ProcessExit // The exit code of the process
-	Lines     int
-	Listeners map[string]*ProcessListener
-	Lock      sync.Mutex // Lock for thread safety
-	Done      *sync.Cond // Cond for thread safety
+	ID              string       // Unique identifier for the process
+	Command         string       // The command that was executed
+	PID             int          // Process ID
+	StartTime       time.Time    // When the process was started
+	Cmd             *exec.Cmd    // The actual command object
+	Exit            *ProcessExit // The exit code of the process
+	Lines           int
+	Listeners       map[string]*ProcessListener
+	Lock            sync.Mutex // Lock for thread safety
+	Done            *sync.Cond // Cond for thread safety
+	lastOutputLines [][]byte
+	lastOutputIndex int
 }
 
 func (p *ProcessInfo) copyMessage(data []byte) *ProcessMessage {
@@ -224,6 +226,24 @@ func (p *ProcessInfo) copyMessage(data []byte) *ProcessMessage {
 		Data:  dataCopy,
 		Start: p.Lines,
 		Lines: bytes.Count(data, []byte("\n")),
+	}
+}
+
+func (p *ProcessInfo) storeContextLines(data []byte) {
+	i := 0
+	for i < len(data)-1 {
+		j := bytes.Index(data[i:], []byte("\n"))
+		if j == -1 {
+			j = len(data)
+		} else {
+			j += i
+		}
+		p.lastOutputLines[p.lastOutputIndex] = append([]byte{}, data[i:j]...)
+		p.lastOutputIndex = (p.lastOutputIndex + 1) % 5
+		i = j + 1
+		if i < len(data) {
+			p.lastOutputLines[p.lastOutputIndex] = []byte{}
+		}
 	}
 }
 
@@ -241,6 +261,7 @@ func (p *ProcessInfo) Copy(r io.Reader) {
 
 		// Write to all attached listeners
 		p.Lock.Lock()
+		p.storeContextLines(buf[:n])
 		for _, listener := range p.Listeners {
 			listener.Forward(p.copyMessage(buf[:n]))
 		}
@@ -296,6 +317,33 @@ func (r *ProcessRegistry) AttachListener(processID string, listener *ProcessList
 	process.Lock.Lock()
 	defer process.Lock.Unlock()
 
+	// If we have previous output lines, send them first
+	if process.lastOutputLines != nil {
+		var contextLines [][]byte
+		// Collect the last 5 lines in correct order
+		for i := 0; i < 5; i++ {
+			idx := (process.lastOutputIndex + i) % 5
+			if process.lastOutputLines[idx] != nil && len(process.lastOutputLines[idx]) > 0 {
+				contextLines = append(contextLines, process.lastOutputLines[idx])
+			}
+		}
+
+		// If we have context lines, send them first
+		if len(contextLines) > 0 {
+			// Join the lines with newlines
+			contextData := bytes.Join(contextLines, []byte("\n"))
+			contextData = append(contextData, '\n') // Add final newline
+
+			// Send the context as a separate message
+			contextMsg := &ProcessMessage{
+				Data:  contextData,
+				Start: process.Lines - len(contextLines),
+				Lines: len(contextLines),
+			}
+			listener.Forward(contextMsg)
+		}
+	}
+
 	process.Listeners[listener.ID] = listener
 
 	return nil
@@ -310,15 +358,18 @@ func (r *ProcessRegistry) registerProcess(cmd string, command *exec.Cmd, listene
 	processID := fmt.Sprintf("%s-%d", cmd, time.Now().UnixNano())
 
 	process := &ProcessInfo{
-		ID:        processID,
-		Command:   cmd,
-		PID:       -1,
-		StartTime: time.Now(),
-		Cmd:       command,
-		Lines:     0,
-		Exit:      NewProcessExit(),
-		Listeners: make(map[string]*ProcessListener),
+		ID:              processID,
+		Command:         cmd,
+		PID:             -1,
+		StartTime:       time.Now(),
+		Cmd:             command,
+		Lines:           0,
+		Exit:            NewProcessExit(),
+		Listeners:       make(map[string]*ProcessListener),
+		lastOutputLines: make([][]byte, 5),
+		lastOutputIndex: 0,
 	}
+	process.lastOutputLines[0] = []byte{}
 	r.processes[processID] = process
 
 	// Add the writer if provided

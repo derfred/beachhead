@@ -121,7 +121,7 @@ func NewServer(cfg config) *Server {
 	// Add path proxy handlers
 	if len(cfg.PathProxies) > 0 {
 		pathProxyHandler := NewPathProxyHandler(cfg.PathProxies)
-		extMux.Handle("/", authenticate(cfg.authToken, pathProxyHandler))
+		extMux.Handle("/", pathProxyHandler)
 	}
 
 	result.externalServer = &http.Server{

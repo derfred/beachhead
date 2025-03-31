@@ -414,7 +414,6 @@ func (workspace *WorkspaceHandler) MakeExecHandler() http.HandlerFunc {
 
 			err := outputListener.Write(w)
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
 
