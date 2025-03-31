@@ -282,8 +282,8 @@ func (p *ProcessInfo) Wait() int {
 func (p *ProcessInfo) RemoveListener(listener *ProcessListener) {
 	p.Lock.Lock()
 	defer p.Lock.Unlock()
-	delete(p.Listeners, listener.ID)
 	listener.Shutdown()
+	delete(p.Listeners, listener.ID)
 }
 
 // ProcessRegistry manages running processes
