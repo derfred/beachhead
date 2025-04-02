@@ -18,6 +18,7 @@ type Server struct {
 	proxy               *Proxy
 	workspace           *WorkspaceHandler
 	pathProxies         []PathProxyRule
+	metrics             *MetricsCollector
 }
 
 func authenticate(authToken string, next http.Handler) http.Handler {
@@ -41,10 +42,13 @@ func authenticate(authToken string, next http.Handler) http.Handler {
 }
 
 func NewServer(cfg config) *Server {
+	metricsCollector := NewMetricsCollector()
+
 	result := Server{
 		proxy:       NewProxy(),
 		workspace:   NewWorkspaceHandler(cfg),
 		pathProxies: cfg.PathProxies,
+		metrics:     metricsCollector,
 	}
 
 	// Generate self-signed cert if not provided via env vars.
@@ -79,6 +83,10 @@ func NewServer(cfg config) *Server {
 	extMux.Handle("/workspace/upload/", authenticate(cfg.authToken, result.workspace.MakeWorkspaceUploadHandler()))
 	extMux.Handle("/workspace/download/", authenticate(cfg.authToken, result.workspace.MakeWorkspaceDownloadHandler()))
 	extMux.Handle("/ws", authenticate(cfg.authToken, http.HandlerFunc(result.proxy.HandleConnection)))
+
+	// Add metrics endpoints
+	extMux.Handle("/metrics", metricsCollector.PrometheusHandler())
+	extMux.Handle("/metrics/history", authenticate(cfg.authToken, http.HandlerFunc(metricsCollector.MetricsHandler)))
 
 	// Process management endpoints
 	extMux.Handle("/workspace/exec/", authenticate(cfg.authToken, result.workspace.MakeExecHandler()))
@@ -146,6 +154,8 @@ func NewServer(cfg config) *Server {
 }
 
 func (s *Server) Start() {
+	s.metrics.Start()
+
 	go func() {
 		log.Printf("Starting internal HTTP server on %s", s.internalListener.Addr().String())
 		if err := s.internalServer.Serve(s.internalListener); err != nil && err != http.ErrServerClosed {
@@ -175,6 +185,8 @@ func (s *Server) GetExternalPort() int {
 }
 
 func (s *Server) Shutdown() {
+	s.metrics.Stop()
+
 	if err := s.internalServer.Close(); err != nil {
 		log.Printf("Error shutting down internal server: %v", err)
 	}

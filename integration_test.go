@@ -274,7 +274,6 @@ func TestExecIntegration(t *testing.T) {
 		"echo": {Template: "echo {{.args}}"},
 	}, nil)
 	go server.Start()
-	defer server.Shutdown()
 	defer cleanup()
 
 	// Wait briefly for the server to start.
