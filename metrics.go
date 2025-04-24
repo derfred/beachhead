@@ -136,7 +136,6 @@ func (mc *MetricsCollector) Start() {
 
 // Stop halts metrics collection
 func (mc *MetricsCollector) Stop() {
-	log.Println("Stopping metrics collector")
 	close(mc.stopChan)
 }
 

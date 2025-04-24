@@ -404,6 +404,7 @@ func (r *ProcessRegistry) ListProcesses() []map[string]interface{} {
 			"pid":          process.PID,
 			"start_time":   process.StartTime,
 			"running_time": time.Since(process.StartTime).String(),
+			"exited":       process.Exit.IsSet(),
 		}
 		process.Lock.Unlock()
 		result = append(result, info)
