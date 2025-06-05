@@ -1302,6 +1302,145 @@ func TestPathProxyIntegration(t *testing.T) {
 	}
 }
 
+// TestProcessOutputCatchupAfterExit tests getting output from an already completed process
+func TestProcessOutputCatchupAfterExit(t *testing.T) {
+	// Start a server with echo command template
+	server, certPool, cleanup := buildServer(t, map[string]ShellTemplate{
+		"echo": {Template: "echo 'Process output line 1' && echo 'Process output line 2' && echo 'Process output line 3'"},
+	}, nil)
+	go server.Start()
+	defer cleanup()
+	time.Sleep(1 * time.Second)
+
+	// Create a workspace
+	tempWorkspace, err := os.MkdirTemp("", "workspace_test_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp workspace: %v", err)
+	}
+	defer os.RemoveAll(tempWorkspace)
+	server.workspace.current = tempWorkspace
+
+	// Configure HTTP client
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{RootCAs: certPool},
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// Start an echo process without following the output
+	reqBody, err := json.Marshal(map[string]interface{}{})
+	if err != nil {
+		t.Fatalf("Failed to marshal JSON: %v", err)
+	}
+
+	execURL := fmt.Sprintf("https://localhost:%d/workspace/exec/echo?follow=false", server.GetExternalPort())
+	req, err := http.NewRequest(http.MethodPost, execURL, bytes.NewBuffer(reqBody))
+	if err != nil {
+		t.Fatalf("Failed to create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	// Execute the command
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to execute command: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("Expected status 202, got %d", resp.StatusCode)
+	}
+
+	// Get the process ID from the Location header
+	locationHeader := resp.Header.Get("Location")
+	if locationHeader == "" {
+		t.Fatalf("No Location header returned")
+	}
+	processID := strings.TrimPrefix(locationHeader, "/workspace/process/")
+
+	// Wait a bit for the process to complete
+	time.Sleep(2 * time.Second)
+
+	// Verify the process has exited by checking its details
+	processDetailsURL := fmt.Sprintf("https://localhost:%d/workspace/process/%s", server.GetExternalPort(), processID)
+	req, err = http.NewRequest(http.MethodGet, processDetailsURL, nil)
+	if err != nil {
+		t.Fatalf("Failed to create process details request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	detailsResp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to get process details: %v", err)
+	}
+	defer detailsResp.Body.Close()
+
+	if detailsResp.StatusCode != http.StatusOK {
+		t.Fatalf("Expected status 200 for process details, got %d", detailsResp.StatusCode)
+	}
+
+	var processDetails map[string]interface{}
+	if err := json.NewDecoder(detailsResp.Body).Decode(&processDetails); err != nil {
+		t.Fatalf("Failed to parse process details: %v", err)
+	}
+
+	// Verify the process has an exit code (indicating it completed)
+	exitCode, hasExitCode := processDetails["exit_code"].(float64)
+	if !hasExitCode {
+		t.Fatalf("Process does not have an exit code, suggesting it hasn't completed yet")
+	}
+	if exitCode != 0 {
+		t.Fatalf("Process exited with non-zero code: %v", exitCode)
+	}
+
+	// Now request the output from the completed process
+	outputURL := fmt.Sprintf("https://localhost:%d/workspace/process/%s/output", server.GetExternalPort(), processID)
+	req, err = http.NewRequest(http.MethodGet, outputURL, nil)
+	if err != nil {
+		t.Fatalf("Failed to create output request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	outputResp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to get output from completed process: %v", err)
+	}
+	defer outputResp.Body.Close()
+
+	if outputResp.StatusCode != http.StatusOK {
+		t.Fatalf("Expected status 200 for output, got %d", outputResp.StatusCode)
+	}
+
+	// Read the output
+	outputContent, err := io.ReadAll(outputResp.Body)
+	if err != nil {
+		t.Fatalf("Failed to read output: %v", err)
+	}
+
+	output := string(outputContent)
+
+	// Verify we got the catchup output even though the process had already completed
+	if !strings.Contains(output, "Process output line 1") {
+		t.Errorf("Output does not contain 'Process output line 1': %s", output)
+	}
+	if !strings.Contains(output, "Process output line 2") {
+		t.Errorf("Output does not contain 'Process output line 2': %s", output)
+	}
+	if !strings.Contains(output, "Process output line 3") {
+		t.Errorf("Output does not contain 'Process output line 3': %s", output)
+	}
+
+	// Verify the exit code in the trailer
+	trailerExitCode := outputResp.Trailer.Get("X-Exit-Code")
+	if trailerExitCode != "0" {
+		t.Errorf("Expected exit code 0 in trailer, got %s", trailerExitCode)
+	}
+}
+
 // Helper function to parse port string to int
 func mustParseInt(s string) int {
 	i, err := strconv.Atoi(s)

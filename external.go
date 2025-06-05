@@ -407,6 +407,7 @@ func (workspace *WorkspaceHandler) MakeExecHandler() http.HandlerFunc {
 		// Execute the command
 		process, err := workspace.processRegistry.Execute(workspace.current, cmd, args, outputListener)
 		if err != nil {
+			log.Printf("Error executing command: %v", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -488,19 +489,42 @@ func (workspace *WorkspaceHandler) ProcessTerminateHandler(w http.ResponseWriter
 	}
 }
 
+// drainBufferedOutput drains all available buffered messages from a ProcessListener
+func drainBufferedOutput(listener *ProcessListener, w http.ResponseWriter) error {
+	for {
+		select {
+		case p := <-listener.writeChan:
+			listener.lines = p.Start
+			listener.openSegment(w)
+			if _, err := w.Write(p.Data); err != nil {
+				return err
+			}
+			listener.lines += p.Lines
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		default:
+			// No more buffered output available
+			return nil
+		}
+	}
+}
+
 // ProcessOutputHandler creates an HTTP handler for streaming process output
 func (workspace *WorkspaceHandler) ProcessOutputHandler(w http.ResponseWriter, r *http.Request, process *ProcessInfo) {
 	// Start the response and get the appropriate writer
 	listener := workspace.startResponse(w, r)
 	defer process.RemoveListener(listener)
 
+	// Always try to provide catchup output, regardless of process state
+	catchup := boolParam(r, "catchup", true)
+	if err := workspace.processRegistry.AttachListener(process.ID, listener, catchup); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to attach to process output: %v", err), http.StatusInternalServerError)
+		return
+	}
+
 	if !process.Exit.IsSet() {
-		// Add the writer to the process's list of writers
-		catchup := boolParam(r, "catchup", true)
-		if err := workspace.processRegistry.AttachListener(process.ID, listener, catchup); err != nil {
-			http.Error(w, fmt.Sprintf("Failed to attach to process output: %v", err), http.StatusInternalServerError)
-			return
-		}
+		// Process is still running, stream live output
 		err := listener.Write(w)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -509,6 +533,12 @@ func (workspace *WorkspaceHandler) ProcessOutputHandler(w http.ResponseWriter, r
 
 		// Wait for the process to complete
 		process.Wait()
+	} else {
+		// Process has already exited, just send the catchup buffer and close
+		if err := drainBufferedOutput(listener, w); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 
 	// Close the writer (no-op if not in markup mode)
