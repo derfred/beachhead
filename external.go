@@ -474,18 +474,43 @@ func (workspace *WorkspaceHandler) ProcessDetailsHandler(w http.ResponseWriter, 
 
 // MakeProcessTerminateHandler creates an HTTP handler for terminating a process
 func (workspace *WorkspaceHandler) ProcessTerminateHandler(w http.ResponseWriter, process *ProcessInfo) {
+	// Create a channel to receive status updates
+	statusCh := make(chan TerminationStatus, 1)
+
 	// Call the ProcessRegistry to terminate the process
-	if err := workspace.processRegistry.TerminateProcess(process.ID); err != nil {
+	if err := workspace.processRegistry.TerminateProcess(process.ID, statusCh); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to terminate process: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// Return success response
-	w.WriteHeader(http.StatusOK)
-	resp := map[string]string{"status": "terminated", "id": process.ID}
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		log.Printf("Error encoding termination response: %v", err)
+	// Wait for status update from the termination goroutine
+	select {
+	case status := <-statusCh:
+		// Respond with the status
+		if status.Completed {
+			w.WriteHeader(http.StatusOK)
+		} else {
+			// Return 202 Accepted for partial completion
+			w.WriteHeader(http.StatusAccepted)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(status); err != nil {
+			log.Printf("Error encoding termination response: %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		// Timeout fallback - this shouldn't happen since we wait 500ms in the function
+		w.WriteHeader(http.StatusAccepted)
+		resp := TerminationStatus{
+			ID:        process.ID,
+			Status:    "terminating",
+			Completed: false,
+			Message:   "Termination initiated, process continuing in background",
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			log.Printf("Error encoding timeout termination response: %v", err)
+		}
 	}
 }
 

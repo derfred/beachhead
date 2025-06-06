@@ -6,8 +6,10 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"text/template"
@@ -118,7 +120,10 @@ func (l *ProcessListener) Close(rw http.ResponseWriter, exitCode int) {
 		return
 	}
 
-	l.Shutdown()
+	// Shutdown the listener without calling the Shutdown method to avoid deadlock
+	l.IsClosed = true
+	close(l.stopChan)
+	close(l.writeChan)
 
 	if !l.markupMode {
 		return
@@ -413,25 +418,194 @@ func (r *ProcessRegistry) ListProcesses() []map[string]interface{} {
 	return result
 }
 
-// TerminateProcess sends a signal to terminate a process
-func (r *ProcessRegistry) TerminateProcess(id string) error {
+// findChildProcesses recursively finds all child processes of a given PID
+func findChildProcesses(parentPID int) ([]int, error) {
+	var allPIDs []int
+	allPIDs = append(allPIDs, parentPID)
+
+	// Use ps command to find child processes
+	cmd := exec.Command("ps", "-eo", "pid,ppid", "--no-headers")
+	output, err := cmd.Output()
+	if err != nil {
+		// If ps command fails, just return the parent PID
+		log.Printf("Warning: ps command failed: %v", err)
+		return allPIDs, nil
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	pidMap := make(map[int][]int) // parent -> children mapping
+
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			pid, err1 := strconv.Atoi(fields[0])
+			ppid, err2 := strconv.Atoi(fields[1])
+			if err1 == nil && err2 == nil {
+				pidMap[ppid] = append(pidMap[ppid], pid)
+			}
+		}
+	}
+
+	// Recursively find all descendants
+	var findDescendants func(int)
+	findDescendants = func(parentPID int) {
+		if children, exists := pidMap[parentPID]; exists {
+			for _, childPID := range children {
+				allPIDs = append(allPIDs, childPID)
+				findDescendants(childPID) // Recursive call for grandchildren
+			}
+		}
+	}
+
+	findDescendants(parentPID)
+	return allPIDs, nil
+}
+
+// isProcessAlive checks if a process with the given PID is still running
+func isProcessAlive(pid int) bool {
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+
+	// On Unix systems, sending signal 0 checks if the process exists
+	err = process.Signal(syscall.Signal(0))
+	return err == nil
+}
+
+// signalProcess sends a signal to a process if it's still alive
+func signalProcess(pid int, sig syscall.Signal) error {
+	if !isProcessAlive(pid) {
+		return nil // Process is already dead
+	}
+
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+
+	return process.Signal(sig)
+}
+
+// TerminationStatus represents the status of a process termination
+type TerminationStatus struct {
+	ID        string `json:"id"`
+	Status    string `json:"status"`
+	Completed bool   `json:"completed"`
+	Remaining int    `json:"remaining,omitempty"`
+	Message   string `json:"message,omitempty"`
+}
+
+// TerminateProcess sends a signal to terminate a process using a multi-step approach
+// If statusCh is provided, it will receive a status update after 500ms
+func (r *ProcessRegistry) TerminateProcess(id string, statusCh chan<- TerminationStatus) error {
 	process, exists := r.GetProcess(id)
 	if !exists {
 		return fmt.Errorf("process with ID %s not found", id)
 	}
 
 	process.Lock.Lock()
-	defer process.Lock.Unlock()
-
-	// Try to kill the process gracefully first (SIGTERM)
-	if err := process.Cmd.Process.Signal(syscall.SIGTERM); err != nil {
-		// If SIGTERM fails, force kill with SIGKILL
-		if killErr := process.Cmd.Process.Kill(); killErr != nil {
-			return fmt.Errorf("failed to kill process: %v", killErr)
-		}
+	parentPID := process.PID
+	if parentPID <= 0 {
+		process.Lock.Unlock()
+		return fmt.Errorf("invalid process PID: %d", parentPID)
 	}
+	process.Lock.Unlock()
 
-	process.Exit.Wait()
+	// Move termination logic to a goroutine
+	go func() {
+		process.Lock.Lock()
+		defer process.Lock.Unlock()
+
+		// Step 1: Recursively enumerate the process PID and all children
+		allPIDs, err := findChildProcesses(parentPID)
+		if err != nil {
+			log.Printf("Warning: Failed to find child processes for PID %d: %v", parentPID, err)
+			// Continue with just the parent PID
+			allPIDs = []int{parentPID}
+		}
+
+		log.Printf("Found %d processes to terminate: %v", len(allPIDs), allPIDs)
+		log.Printf("Sending SIGTERM to parent process %d", parentPID)
+
+		// Step 2: Send graceful shutdown signal (SIGTERM) to parent process only
+		if err := signalProcess(parentPID, syscall.SIGTERM); err != nil {
+			log.Printf("Warning: Failed to send SIGTERM to parent process %d: %v", parentPID, err)
+		}
+
+		// Wait 500ms and check status if status channel is provided
+		time.Sleep(500 * time.Millisecond)
+
+		if statusCh != nil {
+			// Count how many processes are still alive after 500ms
+			var aliveCount int
+			for _, pid := range allPIDs {
+				if isProcessAlive(pid) {
+					aliveCount++
+				}
+			}
+
+			// Send status update
+			if aliveCount == 0 {
+				statusCh <- TerminationStatus{
+					ID:        id,
+					Status:    "terminated",
+					Completed: true,
+					Message:   "All processes terminated successfully",
+				}
+			} else {
+				statusCh <- TerminationStatus{
+					ID:        id,
+					Status:    "terminating",
+					Completed: false,
+					Remaining: aliveCount,
+					Message:   fmt.Sprintf("Termination in progress, %d processes still running", aliveCount),
+				}
+			}
+		}
+
+		// Continue with the rest of the termination process
+		// Step 3: Wait additional time (1.5 seconds more to complete the original 2 seconds)
+		time.Sleep(1500 * time.Millisecond)
+
+		var stillRunningPIDs []int
+
+		// Step 4: Send SIGKILL to all remaining processes
+		for _, pid := range allPIDs {
+			if isProcessAlive(pid) {
+				stillRunningPIDs = append(stillRunningPIDs, pid)
+			}
+		}
+
+		log.Printf("Still running processes (%d): %v", len(stillRunningPIDs), stillRunningPIDs)
+		for _, pid := range stillRunningPIDs {
+			if err := signalProcess(pid, syscall.SIGKILL); err != nil {
+				log.Printf("Warning: Failed to send SIGKILL to process %d: %v", pid, err)
+			}
+		}
+
+		// Step 5: Wait 2 seconds
+		time.Sleep(2 * time.Second)
+
+		var remainingPIDs []int
+
+		// Step 6: Send final kill signal (SIGKILL) to all remaining processes
+		for _, pid := range allPIDs {
+			if isProcessAlive(pid) {
+				remainingPIDs = append(remainingPIDs, pid)
+			}
+		}
+
+		log.Printf("Remaining processes (%d): %v", len(remainingPIDs), remainingPIDs)
+		for _, pid := range remainingPIDs {
+			if err := signalProcess(pid, syscall.SIGKILL); err != nil {
+				log.Printf("Warning: Failed to send SIGKILL to process %d: %v", pid, err)
+			}
+		}
+
+		time.Sleep(2 * time.Second)
+		log.Printf("Termination process completed for process %s", id)
+	}()
 
 	return nil
 }
@@ -443,7 +617,8 @@ func (r *ProcessRegistry) Execute(cwd string, cmd string, args map[string]interf
 		return nil, fmt.Errorf("command not found: %s", cmd)
 	}
 
-	tmpl, err := template.New("cmd").Parse(shellTmpl.Template)
+	// Parse & render the template
+	tmpl, err := template.New("cmd").Option("missingkey=error").Parse(shellTmpl.Template)
 	if err != nil {
 		return nil, fmt.Errorf("template parse error: %v", err)
 	}
@@ -459,6 +634,14 @@ func (r *ProcessRegistry) Execute(cwd string, cmd string, args map[string]interf
 		finalCmd = "sudo -u " + shellTmpl.User + " " + finalCmd
 	}
 
+	// Log the command
+	if shellTmpl.User != "" {
+		log.Printf("Executing command as user %s: %s (cwd: %s)", shellTmpl.User, finalCmd, cwd)
+	} else {
+		log.Printf("Executing command: %s (cwd: %s)", finalCmd, cwd)
+	}
+
+	// Execute the command
 	shellcmd := exec.Command("sh", "-c", finalCmd)
 	shellcmd.Dir = cwd
 

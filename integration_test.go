@@ -638,20 +638,30 @@ func TestProcessTerminationIntegration(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	// The response can be either 200 (completed) or 202 (in progress)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
 		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("Expected status 200 for termination, got %d: %s", resp.StatusCode, string(body))
+		t.Fatalf("Expected status 200 or 202 for termination, got %d: %s", resp.StatusCode, string(body))
 	}
 
-	// Verify response
-	var terminateResp map[string]string
+	// Verify response - now expecting TerminationStatus structure
+	var terminateResp TerminationStatus
 	if err := json.NewDecoder(resp.Body).Decode(&terminateResp); err != nil {
 		t.Fatalf("Failed to parse termination response: %v", err)
 	}
 
-	if terminateResp["status"] != "terminated" || terminateResp["id"] != processID {
-		t.Fatalf("Unexpected termination response: %v", terminateResp)
+	if terminateResp.ID != processID {
+		t.Fatalf("Unexpected process ID in termination response. Expected: %s, Got: %s", processID, terminateResp.ID)
 	}
+
+	// Status should be either "terminated" or "terminating"
+	if terminateResp.Status != "terminated" && terminateResp.Status != "terminating" {
+		t.Fatalf("Unexpected status in termination response: %s", terminateResp.Status)
+	}
+
+	// Log the response for debugging
+	t.Logf("Termination response: Status=%s, Completed=%t, Remaining=%d, Message=%s",
+		terminateResp.Status, terminateResp.Completed, terminateResp.Remaining, terminateResp.Message)
 
 	// Wait a bit for the termination to take effect
 	time.Sleep(1 * time.Second)
