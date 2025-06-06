@@ -73,7 +73,11 @@ func (w *ProcessListener) Forward(p *ProcessMessage) bool {
 func (l *ProcessListener) Write(rw http.ResponseWriter) error {
 	for {
 		select {
-		case p := <-l.writeChan:
+		case p, ok := <-l.writeChan:
+			if !ok {
+				// Channel is closed
+				return nil
+			}
 			l.lines = p.Start
 			l.openSegment(rw)
 			if _, err := rw.Write(p.Data); err != nil {
@@ -525,9 +529,6 @@ func (r *ProcessRegistry) TerminateProcess(id string, statusCh chan<- Terminatio
 			allPIDs = []int{parentPID}
 		}
 
-		log.Printf("Found %d processes to terminate: %v", len(allPIDs), allPIDs)
-		log.Printf("Sending SIGTERM to parent process %d", parentPID)
-
 		// Step 2: Send graceful shutdown signal (SIGTERM) to parent process only
 		if err := signalProcess(parentPID, syscall.SIGTERM); err != nil {
 			log.Printf("Warning: Failed to send SIGTERM to parent process %d: %v", parentPID, err)
@@ -596,15 +597,12 @@ func (r *ProcessRegistry) TerminateProcess(id string, statusCh chan<- Terminatio
 			}
 		}
 
-		log.Printf("Remaining processes (%d): %v", len(remainingPIDs), remainingPIDs)
 		for _, pid := range remainingPIDs {
 			if err := signalProcess(pid, syscall.SIGKILL); err != nil {
 				log.Printf("Warning: Failed to send SIGKILL to process %d: %v", pid, err)
 			}
 		}
 
-		time.Sleep(2 * time.Second)
-		log.Printf("Termination process completed for process %s", id)
 	}()
 
 	return nil
